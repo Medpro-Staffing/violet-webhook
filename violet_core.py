@@ -564,8 +564,9 @@ def handle_conversation_complete(chat, args, notify_fn=None):
 
     fs_ok, fs_result = create_form_submission(record)
     if not fs_ok:
+        err_detail = fs_result.get('error', 'unknown')
         log.error(f"[{chat_id[:12]}] ERROR: Form Submission create failed: {fs_result}")
-        return {'status': 'error', 'message': 'Failed to create lead record'}
+        return {'status': 'error', 'message': f'Failed to create lead record: {err_detail}'}
 
     submission_id = fs_result.get('id', '')
 
@@ -673,8 +674,9 @@ def handle_qualified(chat, args, notify_fn=None):
         }
         fs_ok, fs_result = create_form_submission(record)
         if not fs_ok:
+            err_detail = fs_result.get('error', 'unknown')
             log.error(f"[{chat_id[:12]}] ERROR: Form Submission create failed: {fs_result}")
-            return {'status': 'error', 'message': 'Failed to create lead record'}
+            return {'status': 'error', 'message': f'Failed to create lead record: {err_detail}'}
 
         submission_id = fs_result.get('id', '')
         log.info(f"[{chat_id[:12]}] CREATED QUALIFIED: Form Submission {submission_id}")
