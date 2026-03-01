@@ -152,6 +152,13 @@ def webhook_tool():
     call_data = payload.get('call', {})
     args = payload.get('args', {})
 
+    # Log raw payload structure for debugging
+    log.info(f"Tool payload keys: {list(payload.keys())}")
+    log.info(f"call_data keys: {list(call_data.keys()) if call_data else 'EMPTY'}")
+    if call_data:
+        dv = call_data.get('dynamic_variables', {})
+        log.info(f"dynamic_variables keys: {list(dv.keys()) if dv else 'EMPTY'}")
+
     # Merge dynamic_variables into call_data for consistency with existing extractors
     chat = {
         **call_data,
