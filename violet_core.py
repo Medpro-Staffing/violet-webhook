@@ -28,7 +28,7 @@ SKIP_AGENTS = {
 
 # Form Submission constants
 FORM_SOURCE = 'Violet AI'
-FORM_TYPE = 'Apply Now - Violet AI'
+FORM_TYPE = 'Apply Now - Bot'
 RECORD_TYPE_ID = '0123m0000019N8uAAE'
 
 # Interest levels that warrant lead creation
@@ -134,6 +134,9 @@ def create_form_submission(record):
         sf_record['Priority_Submit_Candidate__c'] = True
 
     # Candidate details from dynamic variables
+    # Note: Your_Specialty__c omitted — restricted picklist uses full names
+    # (e.g., "Registered Nurse") but dynamic_variables have abbreviations ("RN").
+    # Specialty is already on the Contact record.
     for field, key in [
         ('Job_Title__c', 'job_title'),
         ('Job_City__c', 'job_city'),
@@ -142,7 +145,6 @@ def create_form_submission(record):
         ('Your_Last__c', 'candidate_last_name'),
         ('Your_Phone__c', 'candidate_phone'),
         ('Your_Email__c', 'candidate_email'),
-        ('Your_Specialty__c', 'candidate_specialty'),
     ]:
         val = record.get(key, '')
         if val:
