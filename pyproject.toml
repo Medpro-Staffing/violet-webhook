@@ -1,13 +1,15 @@
-[project]
+[tool.poetry]
 name = "violet-webhook"
 version = "1.0.0"
 description = "Violet -> Salesforce webhook service for real-time candidate handoff"
-requires-python = ">=3.11"
-dependencies = [
-    "flask>=3.0",
-    "gunicorn>=21.2",
-    "requests>=2.31",
-]
+authors = ["MedPro Staffing"]
 
-[tool.poetry.scripts]
-serve = "gunicorn app:app --bind 0.0.0.0:5000 --workers 2"
+[tool.poetry.dependencies]
+python = ">=3.11"
+flask = ">=3.0"
+gunicorn = ">=21.2"
+requests = ">=2.31"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
