@@ -150,6 +150,12 @@ def create_form_submission(record):
         if val:
             sf_record[field] = val
 
+    # Your_Email__c is REQUIRED — Apex trigger uses it as the primary key
+    # for contact matching. Generate a fallback if not provided.
+    if 'Your_Email__c' not in sf_record:
+        contact_id = record.get('contact_id', 'unknown')
+        sf_record['Your_Email__c'] = f'{contact_id}@violet-ai.medpro.com'
+
     # Conversation summary
     if record.get('summary'):
         sf_record['Questions_Comments__c'] = record['summary'][:3000]
