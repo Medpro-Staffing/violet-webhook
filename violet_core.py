@@ -1,22 +1,24 @@
-"""Violet Core — Business logic for chat classification, extraction, and SF sync.
+"""Violet Core — Business logic for real-time Violet → Salesforce lead handoff.
 
-Extracted from violet_sf_sync.py for use in the webhook service.
+Handles custom tool triggers from RetellAI Violet agent and chat_analyzed
+fallback webhooks. Creates Form Submissions + Tasks instead of Job Applicants.
+
+Handlers:
+  handle_first_response()        — Log engagement when candidate replies
+  handle_optout()                — Update SF Contact opt-out fields
+  handle_conversation_complete() — Create Form Submission + Task for interested leads
+  handle_qualified()             — Create/update Form Submission (high priority) + Task
+  handle_chat_analyzed()         — Fallback: enrich or create from post-chat analysis
 """
 
 import logging
 import time
+from datetime import date
+
 import requests
 from salesforce_client import sf_query_all, get_salesforce_credentials
 
 log = logging.getLogger('violet_core')
-
-# Stage assignments in Salesforce
-STAGE_QUALIFIED = 'New Application'
-STAGE_INTERESTED = 'Candidate Interested'
-
-# Minimum qualification levels to sync
-SYNC_QUAL_RESULTS = ('fully_qualified', 'partially_qualified')
-SYNC_INTEREST_LEVELS = ('very_interested', 'somewhat_interested')
 
 # Agents to skip (no longer active or no job data)
 SKIP_AGENTS = {
@@ -24,42 +26,18 @@ SKIP_AGENTS = {
     'Violet - MedPro Inbound Lead Agent',
 }
 
+# Form Submission constants
+FORM_SOURCE = 'Violet AI'
+FORM_TYPE = 'Apply Now - Violet AI'
+RECORD_TYPE_ID = '0123m0000019N8uAAE'
 
-def classify_chat(chat):
-    """Classify a chat into a sync action.
+# Interest levels that warrant lead creation
+INTERESTED_LEVELS = ('very_interested', 'somewhat_interested')
 
-    Returns:
-        ('qualified', stage) | ('interested', stage) | ('skip', reason)
-    """
-    agent = chat.get('agent_name', '')
-    if agent in SKIP_AGENTS:
-        return ('skip', f'agent skipped: {agent}')
 
-    # For webhook mode, chat_analyzed events may not have chat_status='ended'
-    # but they always have analysis data. Only skip if explicitly ongoing.
-    status = chat.get('chat_status', '')
-    if status == 'ongoing':
-        return ('skip', 'chat still ongoing')
-
-    ca = chat.get('chat_analysis') or {}
-    custom = ca.get('custom_analysis_data') or {}
-
-    if not custom:
-        return ('skip', 'no analysis data')
-
-    if custom.get('opted_out'):
-        return ('skip', 'opted out')
-
-    qual = custom.get('qualification_result', '')
-    if qual in SYNC_QUAL_RESULTS:
-        return ('qualified', STAGE_QUALIFIED)
-
-    interest = custom.get('interest_level', '')
-    if interest in SYNC_INTEREST_LEVELS:
-        return ('interested', STAGE_INTERESTED)
-
-    return ('skip', f'not qualified/interested (qual={qual}, interest={interest})')
-
+# ══════════════════════════════════════════════════════════════════════
+# ID EXTRACTION (unchanged from v1)
+# ══════════════════════════════════════════════════════════════════════
 
 def extract_contact_id(chat):
     """Extract Salesforce Contact ID from chat data."""
@@ -94,55 +72,179 @@ def extract_job_id(chat):
     return ''
 
 
-def check_existing_applicants(contact_ids):
-    """Check which contact IDs already have Job Applicant records.
+# ══════════════════════════════════════════════════════════════════════
+# SALESFORCE HELPERS
+# ══════════════════════════════════════════════════════════════════════
+
+def check_existing_submissions(contact_id, job_id=None):
+    """Check if a Form Submission already exists for this contact+job.
 
     Returns:
-        set of (contact_id_15, job_id_15) pairs that exist.
+        Form Submission ID if exists, None otherwise
     """
-    existing = set()
-    unique_ids = list(set(contact_ids))
+    if not contact_id:
+        return None
 
-    for i in range(0, len(unique_ids), 25):
-        batch = unique_ids[i:i + 25]
-        ids = "','".join(batch)
-        soql = f"SELECT AVTRRT__Contact_Candidate__c, AVTRRT__Job__c FROM AVTRRT__Job_Applicant__c WHERE AVTRRT__Contact_Candidate__c IN ('{ids}')"
-        try:
-            records = sf_query_all(soql)
-            for r in records:
-                cc = r.get('AVTRRT__Contact_Candidate__c', '')
-                jj = r.get('AVTRRT__Job__c', '')
-                if cc and jj:
-                    existing.add((cc[:15], jj[:15]))
-        except Exception as e:
-            log.warning(f"Dedup query failed for batch: {e}")
+    if job_id:
+        soql = f"SELECT Id FROM Form_Submission__c WHERE Contact_Candidate__c = '{contact_id}' AND Job__c = '{job_id}' AND Source__c = '{FORM_SOURCE}' LIMIT 1"
+    else:
+        soql = f"SELECT Id FROM Form_Submission__c WHERE Contact_Candidate__c = '{contact_id}' AND Source__c = '{FORM_SOURCE}' ORDER BY CreatedDate DESC LIMIT 1"
 
-    return existing
+    try:
+        records = sf_query_all(soql)
+        if records:
+            return records[0].get('Id')
+    except Exception as e:
+        log.warning(f"Dedup query failed: {e}")
+
+    return None
 
 
-def create_job_applicant(record):
-    """Create a single Job Applicant record in Salesforce.
+def create_form_submission(record):
+    """Create a Form_Submission__c record in Salesforce.
 
     Args:
-        record: dict with contact_id, job_id, stage
+        record: dict with contact_id, job_id, lead_outcome, summary,
+                is_qualified, and optional candidate/job detail fields
+
+    Returns:
+        (success: bool, result: dict)
+    """
+    sf_record = {
+        'attributes': {'type': 'Form_Submission__c'},
+        'Contact_Candidate__c': record['contact_id'],
+        'Source__c': FORM_SOURCE,
+        'Form_Type__c': FORM_TYPE,
+        'RecordTypeId': RECORD_TYPE_ID,
+        'Lead_Outcome__c': record.get('lead_outcome', 'Interested - Violet AI'),
+        'Short_Code_Text_Opt_In__c': False,
+        'Seeing__c': False,
+        'Seeking_Sponsorship_to_Work_in_US__c': False,
+        'No_Jobs_Available_Specialty_QA__c': False,
+        'Willing_to_Work_in_Arkansas__c': False,
+    }
+
+    # Job reference
+    if record.get('job_id'):
+        sf_record['Job__c'] = record['job_id']
+
+    # Qualified flags
+    if record.get('is_qualified'):
+        sf_record['Hot_Job_Application__c'] = True
+        sf_record['Priority_Submit_Candidate__c'] = True
+
+    # Candidate details from dynamic variables
+    for field, key in [
+        ('Job_Title__c', 'job_title'),
+        ('Job_City__c', 'job_city'),
+        ('Job_State__c', 'job_state'),
+        ('Your_First__c', 'candidate_first_name'),
+        ('Your_Last__c', 'candidate_last_name'),
+        ('Your_Phone__c', 'candidate_phone'),
+        ('Your_Email__c', 'candidate_email'),
+        ('Your_Specialty__c', 'candidate_specialty'),
+    ]:
+        val = record.get(key, '')
+        if val:
+            sf_record[field] = val
+
+    # Conversation summary
+    if record.get('summary'):
+        sf_record['Questions_Comments__c'] = record['summary'][:3000]
+
+    return _sf_composite_create([sf_record])
+
+
+def update_form_submission(submission_id, fields):
+    """Update an existing Form_Submission__c record.
+
+    Args:
+        submission_id: SF record ID
+        fields: dict of fields to update
+
+    Returns:
+        (success: bool, result: dict)
+    """
+    sf_record = {
+        'attributes': {'type': 'Form_Submission__c'},
+        'Id': submission_id,
+    }
+    sf_record.update(fields)
+
+    return _sf_composite_update([sf_record])
+
+
+def create_contact_task(record):
+    """Create a Task record linked to a Contact and optionally a Job.
+
+    Args:
+        record: dict with contact_id, job_id, subject, description,
+                priority ('High' or 'Normal')
+
+    Returns:
+        (success: bool, result: dict)
+    """
+    sf_record = {
+        'attributes': {'type': 'Task'},
+        'WhoId': record['contact_id'],
+        'Subject': record.get('subject', 'Violet AI Lead'),
+        'Description': record.get('description', '')[:30000],
+        'Status': 'Open',
+        'Priority': record.get('priority', 'Normal'),
+        'ActivityDate': date.today().isoformat(),
+    }
+
+    if record.get('job_id'):
+        sf_record['WhatId'] = record['job_id']
+
+    return _sf_composite_create([sf_record])
+
+
+def update_contact_lead_status(contact_id):
+    """Set Contact Lead_Status__c to 'Hot lead - current' to trigger recruiter notification.
+
+    This fires MedPro's existing Salesforce Flows (Hot_Lead_Notification_D_Allied,
+    DALD_Hot_Lead_Email_Text_Automation_Flow) which email the assigned recruiter.
+
+    Returns:
+        (success: bool, result: dict)
+    """
+    sf_record = {
+        'attributes': {'type': 'Contact'},
+        'Id': contact_id,
+        'Lead_Status__c': 'Hot lead - current',
+    }
+
+    return _sf_composite_update([sf_record])
+
+
+def process_optout(contact_id):
+    """Update SF Contact with opt-out fields.
+
+    Returns:
+        (success: bool, result: dict)
+    """
+    sf_record = {
+        'attributes': {'type': 'Contact'},
+        'Id': contact_id,
+        'simplesms__DoNotSMS__c': True,
+        'Text_Opt_In__c': False,
+        'Text_Opt_Out_Date__c': date.today().isoformat(),
+        'Long_Code_Text_Opt_Out__c': True,
+    }
+
+    return _sf_composite_update([sf_record])
+
+
+def _sf_composite_create(records):
+    """POST to SF Composite API to create records.
 
     Returns:
         (success: bool, result: dict)
     """
     access_token, instance_url = get_salesforce_credentials()
 
-    payload = {
-        'allOrNone': False,
-        'records': [
-            {
-                'attributes': {'type': 'AVTRRT__Job_Applicant__c'},
-                'AVTRRT__Contact_Candidate__c': record['contact_id'],
-                'AVTRRT__Job__c': record['job_id'],
-                'AVTRRT__Stage__c': record['stage'],
-            }
-        ],
-    }
-
+    payload = {'allOrNone': False, 'records': records}
     headers = {
         'Authorization': f'Bearer {access_token}',
         'Content-Type': 'application/json',
@@ -170,40 +272,480 @@ def create_job_applicant(record):
         api_results = resp.json()
         result = api_results[0]
         if result.get('success'):
-            log.info(f"CREATED: {record['contact_id']} + {record['job_id']} -> {result['id']} ({record.get('tier', '?')})")
-            return True, {'applicant_id': result['id']}
+            obj_type = records[0]['attributes']['type']
+            log.info(f"CREATED {obj_type}: {result['id']}")
+            return True, {'id': result['id']}
         else:
             err = str(result.get('errors', []))
-            log.error(f"SF create failed: {record['contact_id']} + {record['job_id']}: {err}")
+            log.error(f"SF create failed: {err}")
             return False, {'error': err}
     else:
         log.error(f"SF API error {resp.status_code}: {resp.text[:300]}")
         return False, {'error': f'HTTP {resp.status_code}: {resp.text[:300]}'}
 
 
-def process_chat_webhook(chat, notify_fn=None):
-    """Orchestrator: classify -> extract -> dedup -> create -> notify.
-
-    Args:
-        chat: Full chat object from RetellAI webhook payload
-        notify_fn: Optional callback(event_type, details_dict) for notifications
+def _sf_composite_update(records):
+    """PATCH to SF Composite API to update records.
 
     Returns:
-        dict with keys: action, detail, contact_id, job_id, sf_result, chat_id
+        (success: bool, result: dict)
+    """
+    access_token, instance_url = get_salesforce_credentials()
+
+    payload = {'allOrNone': False, 'records': records}
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/json',
+    }
+
+    for attempt in range(3):
+        try:
+            resp = requests.patch(
+                f'{instance_url}/services/data/v59.0/composite/sobjects',
+                headers=headers,
+                json=payload,
+                timeout=120,
+            )
+            break
+        except requests.exceptions.ReadTimeout:
+            log.warning(f"SF timeout, attempt {attempt + 1}/3")
+            if attempt < 2:
+                access_token, instance_url = get_salesforce_credentials()
+                headers['Authorization'] = f'Bearer {access_token}'
+                time.sleep(2)
+            else:
+                return False, {'error': 'timeout after 3 attempts'}
+
+    if resp.status_code == 200:
+        api_results = resp.json()
+        result = api_results[0]
+        if result.get('success'):
+            obj_type = records[0]['attributes']['type']
+            log.info(f"UPDATED {obj_type}: {result.get('id', records[0].get('Id', ''))}")
+            return True, {'id': result.get('id', records[0].get('Id', ''))}
+        else:
+            err = str(result.get('errors', []))
+            log.error(f"SF update failed: {err}")
+            return False, {'error': err}
+    else:
+        log.error(f"SF API error {resp.status_code}: {resp.text[:300]}")
+        return False, {'error': f'HTTP {resp.status_code}: {resp.text[:300]}'}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# CONVERSATION ANALYSIS (server-side, replaces waiting for RetellAI)
+# ══════════════════════════════════════════════════════════════════════
+
+def analyze_conversation(transcript, args):
+    """Analyze conversation transcript and tool args to build lead details.
+
+    Combines the LLM-provided tool args with transcript parsing to
+    produce a structured summary for the Form Submission.
+
+    Args:
+        transcript: list of message dicts from RetellAI
+        args: dict of tool parameters filled by the LLM
+
+    Returns:
+        dict with: summary, lead_outcome, is_qualified
+    """
+    interest = args.get('interest_level', 'undecided')
+
+    # Build summary from args + transcript
+    parts = []
+    if args.get('conversation_summary'):
+        parts.append(args['conversation_summary'])
+    if args.get('qualification_summary'):
+        parts.append(f"Qualifications: {args['qualification_summary']}")
+    if args.get('license_type'):
+        parts.append(f"License: {args['license_type']}")
+    if args.get('certifications'):
+        parts.append(f"Certifications: {args['certifications']}")
+    if args.get('experience_months'):
+        parts.append(f"Experience: {args['experience_months']} months")
+    if args.get('available_start'):
+        parts.append(f"Available: {args['available_start']}")
+    if args.get('preferred_contact'):
+        parts.append(f"Preferred contact: {args['preferred_contact']}")
+
+    candidate_available = args.get('candidate_available', False)
+    has_credentials = args.get('has_required_credentials', False)
+
+    if candidate_available:
+        parts.append("Candidate is available")
+    if has_credentials:
+        parts.append("Has required credentials")
+
+    # Add transcript snippet if no summary from args
+    if not parts and transcript:
+        messages = []
+        for msg in transcript[-10:]:
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+            if content:
+                messages.append(f"{role}: {content}")
+        if messages:
+            parts.append("Recent messages:\n" + '\n'.join(messages))
+
+    summary = '\n'.join(parts) if parts else 'No details available'
+
+    # Determine lead outcome
+    is_qualified = bool(
+        interest == 'very_interested'
+        and candidate_available
+        and has_credentials
+    )
+
+    if is_qualified or args.get('qualification_summary'):
+        lead_outcome = 'Qualified - Violet AI'
+    elif interest in INTERESTED_LEVELS:
+        lead_outcome = 'Interested - Violet AI'
+    else:
+        lead_outcome = 'Contacted - Violet AI'
+
+    return {
+        'summary': summary,
+        'lead_outcome': lead_outcome,
+        'is_qualified': is_qualified,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# INTERNAL HELPERS
+# ══════════════════════════════════════════════════════════════════════
+
+def _extract_dynamic_vars(chat):
+    """Pull candidate/job details from dynamic variables into a flat dict."""
+    dv = chat.get('retell_llm_dynamic_variables') or {}
+    return {
+        'candidate_first_name': dv.get('candidate_first_name', ''),
+        'candidate_last_name': dv.get('candidate_last_name', ''),
+        'candidate_phone': dv.get('candidate_phone', ''),
+        'candidate_email': dv.get('candidate_email', ''),
+        'candidate_specialty': dv.get('candidate_specialty', ''),
+        'job_title': dv.get('job_title', ''),
+        'job_city': dv.get('job_city', ''),
+        'job_state': dv.get('job_state', ''),
+    }
+
+
+def _build_task_subject(tier, dv):
+    """Build a descriptive Task subject line."""
+    tier_label = 'QUALIFIED' if tier == 'qualified' else 'INTERESTED'
+    job_desc = dv.get('job_title', 'Unknown')
+    location = f"{dv.get('job_city', '')}"
+    if dv.get('job_state'):
+        location += f" {dv['job_state']}"
+    location = location.strip()
+
+    if location:
+        return f"Violet AI: {tier_label} - {job_desc}, {location}"
+    return f"Violet AI: {tier_label} - {job_desc}"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TOOL HANDLERS — Called from app.py webhook routes
+# ══════════════════════════════════════════════════════════════════════
+
+def handle_first_response(chat, args):
+    """Handle notify_first_response tool call.
+
+    Logs that a candidate replied. No SF write.
+
+    Returns:
+        dict with status and message (returned to agent)
+    """
+    contact_id = extract_contact_id(chat)
+    chat_id = chat.get('chat_id', chat.get('call_id', 'unknown'))
+    summary = args.get('response_summary', '')
+
+    log.info(f"[{chat_id[:12]}] FIRST_RESPONSE: contact={contact_id}, summary={summary[:100]}")
+
+    return {
+        'status': 'acknowledged',
+        'message': 'Response logged',
+    }
+
+
+def handle_optout(chat, args, notify_fn=None):
+    """Handle notify_candidate_optout tool call.
+
+    Updates SF Contact with opt-out fields immediately.
+
+    Returns:
+        dict with status and message (returned to agent)
+    """
+    contact_id = extract_contact_id(chat)
+    chat_id = chat.get('chat_id', chat.get('call_id', 'unknown'))
+    optout_text = args.get('optout_text', '')
+
+    log.info(f"[{chat_id[:12]}] OPT_OUT: contact={contact_id}, text={optout_text[:50]}")
+
+    if not contact_id:
+        log.warning(f"[{chat_id[:12]}] OPT_OUT: no contact ID — cannot update SF")
+        return {
+            'status': 'opt_out_recorded',
+            'message': 'Candidate has been opted out',
+        }
+
+    success, result = process_optout(contact_id)
+
+    if success:
+        log.info(f"[{chat_id[:12]}] OPT_OUT: SF Contact updated")
+        if notify_fn:
+            notify_fn('optout', {
+                'chat_id': chat_id,
+                'contact_id': contact_id,
+                'optout_text': optout_text,
+            })
+    else:
+        log.error(f"[{chat_id[:12]}] OPT_OUT: SF update failed: {result}")
+
+    return {
+        'status': 'opt_out_recorded',
+        'message': 'Candidate has been opted out',
+    }
+
+
+def handle_conversation_complete(chat, args, notify_fn=None):
+    """Handle notify_conversation_complete tool call.
+
+    Creates Form Submission + Task for interested candidates.
+
+    Returns:
+        dict with status and message (returned to agent)
+    """
+    contact_id = extract_contact_id(chat)
+    job_id = extract_job_id(chat)
+    chat_id = chat.get('chat_id', chat.get('call_id', 'unknown'))
+    dv_fields = _extract_dynamic_vars(chat)
+
+    interest = args.get('interest_level', 'undecided')
+    log.info(f"[{chat_id[:12]}] CONVERSATION_COMPLETE: contact={contact_id}, interest={interest}")
+
+    # Only create leads for interested candidates
+    if interest not in INTERESTED_LEVELS:
+        log.info(f"[{chat_id[:12]}] SKIP: not interested ({interest})")
+        return {
+            'status': 'noted',
+            'message': 'Conversation outcome recorded',
+        }
+
+    if not contact_id:
+        log.warning(f"[{chat_id[:12]}] SKIP: no contact ID")
+        return {'status': 'error', 'message': 'Missing contact ID'}
+
+    if not job_id:
+        log.warning(f"[{chat_id[:12]}] SKIP: no job ID")
+        return {'status': 'error', 'message': 'Missing job ID'}
+
+    # Dedup
+    existing_id = check_existing_submissions(contact_id, job_id)
+    if existing_id:
+        log.info(f"[{chat_id[:12]}] DEDUP: Form Submission {existing_id} already exists")
+        return {
+            'status': 'lead_exists',
+            'message': 'Lead already recorded for recruiter review',
+        }
+
+    # Analyze conversation
+    transcript = chat.get('transcript', [])
+    analysis = analyze_conversation(transcript, args)
+
+    # Build Form Submission record
+    record = {
+        'contact_id': contact_id,
+        'job_id': job_id,
+        'lead_outcome': analysis['lead_outcome'],
+        'is_qualified': False,
+        'summary': analysis['summary'],
+        **dv_fields,
+    }
+
+    fs_ok, fs_result = create_form_submission(record)
+    if not fs_ok:
+        log.error(f"[{chat_id[:12]}] ERROR: Form Submission create failed: {fs_result}")
+        return {'status': 'error', 'message': 'Failed to create lead record'}
+
+    submission_id = fs_result.get('id', '')
+
+    # Create Task
+    task_record = {
+        'contact_id': contact_id,
+        'job_id': job_id,
+        'subject': _build_task_subject('interested', dv_fields),
+        'description': analysis['summary'],
+        'priority': 'Normal',
+    }
+    task_ok, task_result = create_contact_task(task_record)
+    if not task_ok:
+        log.warning(f"[{chat_id[:12]}] Task create failed (Form Submission still created): {task_result}")
+
+    # Update Contact Lead_Status__c to trigger recruiter notification Flows
+    ls_ok, ls_result = update_contact_lead_status(contact_id)
+    if not ls_ok:
+        log.warning(f"[{chat_id[:12]}] Lead_Status__c update failed: {ls_result}")
+
+    log.info(f"[{chat_id[:12]}] CREATED: Form Submission {submission_id}")
+
+    if notify_fn:
+        notify_fn('created', {
+            'chat_id': chat_id,
+            'contact_id': contact_id,
+            'job_id': job_id,
+            'submission_id': submission_id,
+            'task_id': task_result.get('id', '') if task_ok else '',
+            'tier': 'interested',
+            'lead_outcome': analysis['lead_outcome'],
+            'job_desc': f"{dv_fields.get('job_title', '')} in {dv_fields.get('job_city', '')}, {dv_fields.get('job_state', '')}",
+            'summary': analysis['summary'][:200],
+            'agent': chat.get('agent_name', ''),
+        })
+
+    return {
+        'status': 'lead_created',
+        'message': 'Lead recorded for recruiter review',
+    }
+
+
+def handle_qualified(chat, args, notify_fn=None):
+    """Handle notify_candidate_qualified tool call.
+
+    Creates or updates Form Submission with high priority + Task.
+
+    Returns:
+        dict with status and message (returned to agent)
+    """
+    contact_id = extract_contact_id(chat)
+    job_id = extract_job_id(chat)
+    chat_id = chat.get('chat_id', chat.get('call_id', 'unknown'))
+    dv_fields = _extract_dynamic_vars(chat)
+
+    log.info(f"[{chat_id[:12]}] QUALIFIED: contact={contact_id}, quals={args.get('qualification_summary', '')[:80]}")
+
+    if not contact_id:
+        log.warning(f"[{chat_id[:12]}] SKIP: no contact ID")
+        return {'status': 'error', 'message': 'Missing contact ID'}
+
+    if not job_id:
+        log.warning(f"[{chat_id[:12]}] SKIP: no job ID")
+        return {'status': 'error', 'message': 'Missing job ID'}
+
+    # Analyze with qualification data
+    transcript = chat.get('transcript', [])
+    analysis = analyze_conversation(transcript, {
+        **args,
+        'interest_level': 'very_interested',
+        'candidate_available': True,
+        'has_required_credentials': True,
+    })
+
+    # Check if Form Submission already exists (from conversation_complete)
+    existing_id = check_existing_submissions(contact_id, job_id)
+
+    if existing_id:
+        # Update existing to qualified
+        update_fields = {
+            'Lead_Outcome__c': 'Qualified - Violet AI',
+            'Hot_Job_Application__c': True,
+            'Priority_Submit_Candidate__c': True,
+        }
+        if analysis['summary']:
+            update_fields['Questions_Comments__c'] = analysis['summary'][:3000]
+
+        upd_ok, upd_result = update_form_submission(existing_id, update_fields)
+        submission_id = existing_id
+
+        if not upd_ok:
+            log.error(f"[{chat_id[:12]}] ERROR: Form Submission update failed: {upd_result}")
+            return {'status': 'error', 'message': 'Failed to update lead record'}
+
+        log.info(f"[{chat_id[:12]}] UPDATED to QUALIFIED: Form Submission {existing_id}")
+    else:
+        # Create new qualified Form Submission
+        record = {
+            'contact_id': contact_id,
+            'job_id': job_id,
+            'lead_outcome': 'Qualified - Violet AI',
+            'is_qualified': True,
+            'summary': analysis['summary'],
+            **dv_fields,
+        }
+        fs_ok, fs_result = create_form_submission(record)
+        if not fs_ok:
+            log.error(f"[{chat_id[:12]}] ERROR: Form Submission create failed: {fs_result}")
+            return {'status': 'error', 'message': 'Failed to create lead record'}
+
+        submission_id = fs_result.get('id', '')
+        log.info(f"[{chat_id[:12]}] CREATED QUALIFIED: Form Submission {submission_id}")
+
+    # Create high-priority Task
+    task_record = {
+        'contact_id': contact_id,
+        'job_id': job_id,
+        'subject': _build_task_subject('qualified', dv_fields),
+        'description': analysis['summary'],
+        'priority': 'High',
+    }
+    task_ok, task_result = create_contact_task(task_record)
+    if not task_ok:
+        log.warning(f"[{chat_id[:12]}] Task create failed (Form Submission still created): {task_result}")
+
+    # Update Contact Lead_Status__c to trigger recruiter notification Flows
+    ls_ok, ls_result = update_contact_lead_status(contact_id)
+    if not ls_ok:
+        log.warning(f"[{chat_id[:12]}] Lead_Status__c update failed: {ls_result}")
+
+    if notify_fn:
+        notify_fn('created', {
+            'chat_id': chat_id,
+            'contact_id': contact_id,
+            'job_id': job_id,
+            'submission_id': submission_id,
+            'task_id': task_result.get('id', '') if task_ok else '',
+            'tier': 'qualified',
+            'lead_outcome': 'Qualified - Violet AI',
+            'job_desc': f"{dv_fields.get('job_title', '')} in {dv_fields.get('job_city', '')}, {dv_fields.get('job_state', '')}",
+            'summary': analysis['summary'][:200],
+            'agent': chat.get('agent_name', ''),
+        })
+
+    return {
+        'status': 'qualified_lead_created',
+        'message': 'Qualified lead recorded, recruiter will be notified',
+    }
+
+
+def handle_chat_analyzed(chat, notify_fn=None):
+    """Handle chat_analyzed webhook (fallback from RetellAI auto-close).
+
+    If a Form Submission already exists → enrich with AI analysis data.
+    If no Form Submission exists → create one from chat_analysis data.
+    Safety net for conversations where custom tools weren't triggered.
+
+    Returns:
+        dict with action, detail, contact_id, job_id, chat_id
     """
     chat_id = chat.get('chat_id', 'unknown')
     result = {'chat_id': chat_id, 'action': None, 'detail': None}
 
-    # 1. Classify
-    action, detail = classify_chat(chat)
-    result['action'] = action
-    result['detail'] = detail
-
-    if action == 'skip':
-        log.info(f"[{chat_id[:12]}] SKIP: {detail}")
+    # Check if agent should be skipped
+    agent = chat.get('agent_name', '')
+    if agent in SKIP_AGENTS:
+        result['action'] = 'skip'
+        result['detail'] = f'agent skipped: {agent}'
+        log.info(f"[{chat_id[:12]}] SKIP: {result['detail']}")
         return result
 
-    # 2. Extract IDs
+    # Skip ongoing chats
+    status = chat.get('chat_status', '')
+    if status == 'ongoing':
+        result['action'] = 'skip'
+        result['detail'] = 'chat still ongoing'
+        log.info(f"[{chat_id[:12]}] SKIP: ongoing")
+        return result
+
+    # Extract IDs
     contact_id = extract_contact_id(chat)
     job_id = extract_job_id(chat)
     result['contact_id'] = contact_id
@@ -221,47 +763,128 @@ def process_chat_webhook(chat, notify_fn=None):
         log.warning(f"[{chat_id[:12]}] SKIP: no job ID")
         return result
 
-    # 3. Dedup against Salesforce
-    existing = check_existing_applicants([contact_id])
-    pair = (contact_id[:15], job_id[:15])
-    if pair in existing:
-        result['action'] = 'duplicate'
-        result['detail'] = 'job applicant already exists in SF'
-        log.info(f"[{chat_id[:12]}] DEDUP: {contact_id} + {job_id} already exists")
-        return result
-
-    # 4. Build record and create
-    dv = chat.get('retell_llm_dynamic_variables') or {}
+    # Parse analysis data
     ca = chat.get('chat_analysis') or {}
     custom = ca.get('custom_analysis_data') or {}
+
+    if not custom:
+        result['action'] = 'skip'
+        result['detail'] = 'no analysis data'
+        log.info(f"[{chat_id[:12]}] SKIP: no analysis data")
+        return result
+
+    # Handle opt-out in analysis
+    if custom.get('opted_out'):
+        result['action'] = 'skip'
+        result['detail'] = 'opted out'
+        log.info(f"[{chat_id[:12]}] SKIP: opted out (handled by tool or during analysis)")
+        return result
+
+    # Determine interest/qualification from analysis
+    qual = custom.get('qualification_result', '')
+    interest = custom.get('interest_level', '')
+    is_qualified = qual in ('fully_qualified', 'partially_qualified')
+    is_interested = interest in INTERESTED_LEVELS
+
+    if not is_qualified and not is_interested:
+        result['action'] = 'skip'
+        result['detail'] = f'not qualified/interested (qual={qual}, interest={interest})'
+        log.info(f"[{chat_id[:12]}] SKIP: {result['detail']}")
+        return result
+
+    dv_fields = _extract_dynamic_vars(chat)
+    summary = (custom.get('conversation_summary') or ca.get('chat_summary', ''))[:3000]
+
+    # Check if Form Submission already exists (created by tool handlers)
+    existing_id = check_existing_submissions(contact_id, job_id)
+
+    if existing_id:
+        # Enrich existing Form Submission with analysis data
+        update_fields = {}
+        if is_qualified:
+            update_fields['Lead_Outcome__c'] = 'Qualified - Violet AI'
+            update_fields['Hot_Job_Application__c'] = True
+            update_fields['Priority_Submit_Candidate__c'] = True
+        if summary:
+            update_fields['Questions_Comments__c'] = summary
+
+        if update_fields:
+            upd_ok, upd_result = update_form_submission(existing_id, update_fields)
+            if upd_ok:
+                result['action'] = 'enriched'
+                result['detail'] = f'Form Submission {existing_id} enriched with analysis'
+                log.info(f"[{chat_id[:12]}] ENRICHED: {existing_id}")
+            else:
+                result['action'] = 'error'
+                result['detail'] = f'Failed to enrich: {upd_result}'
+                log.error(f"[{chat_id[:12]}] ERROR enriching: {upd_result}")
+        else:
+            result['action'] = 'duplicate'
+            result['detail'] = 'Form Submission already exists, no enrichment needed'
+            log.info(f"[{chat_id[:12]}] DEDUP: {existing_id} already exists")
+        return result
+
+    # No existing Form Submission — create from analysis (tools didn't fire)
+    lead_outcome = 'Qualified - Violet AI' if is_qualified else 'Interested - Violet AI'
 
     record = {
         'contact_id': contact_id,
         'job_id': job_id,
-        'stage': detail,
-        'tier': action,
-        'chat_id': chat_id,
-        'summary': (custom.get('conversation_summary') or ca.get('chat_summary', ''))[:500],
-        'job_desc': f"{dv.get('job_title', '')} in {dv.get('job_city', '')}, {dv.get('job_state', '')}",
-        'agent': chat.get('agent_name', ''),
+        'lead_outcome': lead_outcome,
+        'is_qualified': is_qualified,
+        'summary': summary,
+        **dv_fields,
     }
 
-    success, sf_result = create_job_applicant(record)
-    result['sf_result'] = sf_result
+    fs_ok, fs_result = create_form_submission(record)
 
-    if success:
-        result['action'] = 'created'
-        result['detail'] = f"Job Applicant {sf_result.get('applicant_id', '')} created"
-        log.info(f"[{chat_id[:12]}] CREATED: {result['detail']}")
-
-        if notify_fn:
-            notify_fn('created', {**record, **sf_result})
-    else:
+    if not fs_ok:
         result['action'] = 'error'
-        result['detail'] = sf_result.get('error', 'unknown SF error')
+        result['detail'] = fs_result.get('error', 'unknown SF error')
         log.error(f"[{chat_id[:12]}] ERROR: {result['detail']}")
-
         if notify_fn:
-            notify_fn('error', {**record, 'error': result['detail']})
+            notify_fn('error', {
+                'chat_id': chat_id,
+                'contact_id': contact_id,
+                'job_id': job_id,
+                'error': result['detail'],
+            })
+        return result
+
+    submission_id = fs_result.get('id', '')
+
+    # Create Task
+    tier = 'qualified' if is_qualified else 'interested'
+    task_record = {
+        'contact_id': contact_id,
+        'job_id': job_id,
+        'subject': _build_task_subject(tier, dv_fields),
+        'description': summary,
+        'priority': 'High' if is_qualified else 'Normal',
+    }
+    task_ok, task_result = create_contact_task(task_record)
+
+    # Update Contact Lead_Status__c to trigger recruiter notification Flows
+    ls_ok, ls_result = update_contact_lead_status(contact_id)
+    if not ls_ok:
+        log.warning(f"[{chat_id[:12]}] Lead_Status__c update failed: {ls_result}")
+
+    result['action'] = 'created'
+    result['detail'] = f'Form Submission {submission_id} created (fallback)'
+    log.info(f"[{chat_id[:12]}] CREATED (fallback): {submission_id}")
+
+    if notify_fn:
+        notify_fn('created', {
+            'chat_id': chat_id,
+            'contact_id': contact_id,
+            'job_id': job_id,
+            'submission_id': submission_id,
+            'task_id': task_result.get('id', '') if task_ok else '',
+            'tier': tier,
+            'lead_outcome': lead_outcome,
+            'job_desc': f"{dv_fields.get('job_title', '')} in {dv_fields.get('job_city', '')}, {dv_fields.get('job_state', '')}",
+            'summary': summary[:200],
+            'agent': agent,
+        })
 
     return result

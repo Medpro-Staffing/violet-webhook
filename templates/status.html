@@ -11,7 +11,7 @@
         .container { max-width: 900px; margin: 0 auto; }
         h1 { font-size: 1.5rem; margin-bottom: 24px; color: #a78bfa; }
         h1 span { color: #64748b; font-weight: normal; font-size: 0.9rem; margin-left: 12px; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin-bottom: 24px; }
         .card { background: #1e293b; border-radius: 8px; padding: 16px; }
         .card .label { font-size: 0.75rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
         .card .value { font-size: 1.5rem; font-weight: 600; margin-top: 4px; }
@@ -19,6 +19,7 @@
         .card .value.red { color: #f87171; }
         .card .value.yellow { color: #fbbf24; }
         .card .value.blue { color: #60a5fa; }
+        .card .value.purple { color: #a78bfa; }
         .status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
         .status-dot.ok { background: #4ade80; }
         .status-dot.fail { background: #f87171; }
@@ -30,15 +31,19 @@
         td { border-bottom: 1px solid #1e293b; }
         .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
         .badge.created { background: #065f46; color: #6ee7b7; }
-        .badge.skip { background: #1e3a5f; color: #93c5fd; }
-        .badge.duplicate { background: #713f12; color: #fde68a; }
+        .badge.enriched { background: #1e3a5f; color: #93c5fd; }
+        .badge.skip, .badge.noted { background: #1e3a5f; color: #93c5fd; }
+        .badge.duplicate, .badge.lead_exists { background: #713f12; color: #fde68a; }
         .badge.error { background: #7f1d1d; color: #fca5a5; }
+        .badge.optout { background: #581c87; color: #d8b4fe; }
+        .badge.first_response { background: #164e63; color: #67e8f9; }
+        .source-tag { font-size: 0.65rem; color: #94a3b8; margin-left: 4px; }
         .meta { font-size: 0.75rem; color: #475569; margin-top: 16px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Violet Webhook Service <span>auto-refreshes every 30s</span></h1>
+        <h1>Violet Webhook Service <span>v2 &middot; auto-refreshes every 30s</span></h1>
 
         <div class="grid">
             <div class="card">
@@ -53,19 +58,35 @@
                 </div>
             </div>
             <div class="card">
-                <div class="label">Webhooks Received</div>
+                <div class="label">Tool Calls</div>
+                <div class="value purple">{{ tool_calls_received }}</div>
+            </div>
+            <div class="card">
+                <div class="label">Webhooks</div>
                 <div class="value">{{ webhooks_received }}</div>
             </div>
             <div class="card">
-                <div class="label">SF Records Created</div>
+                <div class="label">Leads Created</div>
                 <div class="value green">{{ created }}</div>
             </div>
             <div class="card">
-                <div class="label">Duplicates Skipped</div>
+                <div class="label">Enriched</div>
+                <div class="value blue">{{ enriched }}</div>
+            </div>
+            <div class="card">
+                <div class="label">First Responses</div>
+                <div class="value">{{ first_responses }}</div>
+            </div>
+            <div class="card">
+                <div class="label">Opt-Outs</div>
+                <div class="value yellow">{{ optouts }}</div>
+            </div>
+            <div class="card">
+                <div class="label">Duplicates</div>
                 <div class="value yellow">{{ duplicates }}</div>
             </div>
             <div class="card">
-                <div class="label">Chats Skipped</div>
+                <div class="label">Skipped</div>
                 <div class="value">{{ skipped }}</div>
             </div>
             <div class="card">
@@ -73,7 +94,7 @@
                 <div class="value {% if errors > 0 %}red{% endif %}">{{ errors }}</div>
             </div>
             <div class="card">
-                <div class="label">Dead Letter Queue</div>
+                <div class="label">Dead Letter</div>
                 <div class="value {% if dead_letter_count > 0 %}red{% else %}green{% endif %}">{{ dead_letter_count }}</div>
             </div>
         </div>
@@ -81,8 +102,9 @@
         <div class="section">
             <h2>Timestamps</h2>
             <table>
+                <tr><td style="color:#94a3b8;">Last Tool Call</td><td>{{ last_tool_call }}</td></tr>
                 <tr><td style="color:#94a3b8;">Last Webhook</td><td>{{ last_webhook }}</td></tr>
-                <tr><td style="color:#94a3b8;">Last SF Create</td><td>{{ last_created }}</td></tr>
+                <tr><td style="color:#94a3b8;">Last Lead Created</td><td>{{ last_created }}</td></tr>
             </table>
         </div>
 
@@ -91,13 +113,14 @@
             <h2>Recent Events (last 20)</h2>
             <table>
                 <thead>
-                    <tr><th>Time</th><th>Type</th><th>Chat ID</th><th>Detail</th></tr>
+                    <tr><th>Time</th><th>Type</th><th>Source</th><th>Chat ID</th><th>Detail</th></tr>
                 </thead>
                 <tbody>
                     {% for e in recent_events %}
                     <tr>
                         <td>{{ e.time }}</td>
                         <td><span class="badge {{ e.type }}">{{ e.type }}</span></td>
+                        <td><span class="source-tag">{{ e.source }}</span></td>
                         <td style="font-family:monospace;">{{ e.chat_id }}</td>
                         <td>{{ e.detail }}</td>
                     </tr>
@@ -108,7 +131,7 @@
         {% endif %}
 
         <div class="meta">
-            Violet Webhook Service v1.0 &middot; SF Instance: {{ sf_instance or 'N/A' }}
+            Violet Webhook Service v2.0 &middot; SF Instance: {{ sf_instance or 'N/A' }}
         </div>
     </div>
 </body>
