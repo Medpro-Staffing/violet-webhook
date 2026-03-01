@@ -159,12 +159,14 @@ def webhook_tool():
         dv = call_data.get('dynamic_variables', {})
         log.info(f"dynamic_variables keys: {list(dv.keys()) if dv else 'EMPTY'}")
 
-    # Merge dynamic_variables into call_data for consistency with existing extractors
+    # Merge call_data — RetellAI sends retell_llm_dynamic_variables inside the call object
     chat = {
         **call_data,
-        'retell_llm_dynamic_variables': call_data.get('dynamic_variables', {}),
         'chat_id': call_data.get('call_id', 'unknown'),
     }
+    # Ensure retell_llm_dynamic_variables is present (already in call_data from spread)
+    if 'retell_llm_dynamic_variables' not in chat:
+        chat['retell_llm_dynamic_variables'] = {}
     chat_id = chat['chat_id']
 
     log.info(f"[{chat_id[:12]}] Tool call: {tool_name}")
