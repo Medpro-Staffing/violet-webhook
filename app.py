@@ -137,15 +137,11 @@ def webhook_tool():
     RetellAI POSTs when the LLM triggers a custom tool during conversation.
     The response is returned to the agent as the tool result.
     """
-    # 1. Verify signature
+    # 1. Parse payload (no HMAC verification for tool calls — custom tool
+    #    calls from RetellAI don't send webhook-style signatures; they use
+    #    whatever headers we configured on the tool definition)
     raw_body = request.get_data()
-    signature = request.headers.get('x-retell-signature', '')
 
-    if not verify_retell_signature(raw_body, signature):
-        log.warning("Invalid tool call signature — rejected")
-        return '', 401
-
-    # 2. Parse payload
     try:
         payload = json.loads(raw_body)
     except json.JSONDecodeError:
