@@ -238,7 +238,7 @@ def process_optout(contact_id):
         'simplesms__DoNotSMS__c': True,
         'Text_Opt_In__c': False,
         'Text_Opt_Out_Date__c': date.today().isoformat(),
-        'Long_Code_Text_Opt_Out__c': True,
+        'Long_Code_Text_Opt_Out__c': date.today().isoformat(),
     }
 
     return _sf_composite_update([sf_record])
