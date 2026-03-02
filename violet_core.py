@@ -808,6 +808,8 @@ def handle_qualified(chat, args, notify_fn=None):
     return {
         'status': 'qualified_lead_created',
         'message': 'Qualified lead recorded, recruiter will be notified',
+        'task_created': task_ok,
+        'task_error': str(task_result) if not task_ok else None,
     }
 
 
