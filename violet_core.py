@@ -301,7 +301,7 @@ def create_contact_task(record):
         'WhoId': record['contact_id'],
         'Subject': record.get('subject', 'Violet AI Lead'),
         'Description': description or record.get('description', '')[:30000],
-        'Status': 'Open',
+        'Status': 'Completed',
         'Priority': record.get('priority', 'Normal'),
         'ActivityDate': date.today().isoformat(),
         'Type': 'AI Screening',
