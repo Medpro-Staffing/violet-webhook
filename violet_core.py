@@ -42,6 +42,8 @@ RECRUITER_POOLS = {
         '005A0000004xrDUIAY',  # Camesha Pitterson
         '0053m00000CV1gnAAD',  # Jean-Carlos Beltran
         '005cx000001AzODAA0',  # Bryant Salter
+        '005cx000008TXs1AAG',  # Ronnie Diaz
+        '0052G00000AdNNYQA3',  # Sabrina Cornell
     ],
     'allied': [
         '0053m00000Dm03gAAB',  # Joshua Mayer
