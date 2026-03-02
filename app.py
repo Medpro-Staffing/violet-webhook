@@ -155,7 +155,8 @@ def webhook_tool():
     _last_tool_payload = payload
 
     tool_name = payload.get('name', '')
-    call_data = payload.get('call', {})
+    # RetellAI sends "call" for phone calls, "chat" for SMS chats
+    call_data = payload.get('call', payload.get('chat', {}))
     args = payload.get('args', {})
 
     # Log raw payload structure for debugging
@@ -167,10 +168,10 @@ def webhook_tool():
     # Log full payload for first few calls to diagnose structure
     log.info(f"FULL PAYLOAD: {json.dumps(payload)[:2000]}")
 
-    # Merge call_data — RetellAI sends retell_llm_dynamic_variables inside the call object
+    # Merge call_data — RetellAI sends retell_llm_dynamic_variables inside the call/chat object
     chat = {
         **call_data,
-        'chat_id': call_data.get('call_id', 'unknown'),
+        'chat_id': call_data.get('call_id', call_data.get('chat_id', 'unknown')),
     }
     # Ensure retell_llm_dynamic_variables is present (already in call_data from spread)
     if 'retell_llm_dynamic_variables' not in chat:
