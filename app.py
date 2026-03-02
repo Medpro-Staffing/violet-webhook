@@ -67,6 +67,9 @@ _stats = {
 RETELL_API_KEY = os.environ.get('RETELL_API_KEY', '')
 MAX_RECENT_EVENTS = 50
 
+# Debug: store last raw tool payload for diagnostics
+_last_tool_payload = {}
+
 
 def _record_event(event_type, chat_id, detail, source='webhook'):
     """Thread-safe stats update."""
@@ -148,6 +151,9 @@ def webhook_tool():
         log.warning("Invalid JSON in tool call body")
         return '', 400
 
+    global _last_tool_payload
+    _last_tool_payload = payload
+
     tool_name = payload.get('name', '')
     call_data = payload.get('call', {})
     args = payload.get('args', {})
@@ -156,8 +162,10 @@ def webhook_tool():
     log.info(f"Tool payload keys: {list(payload.keys())}")
     log.info(f"call_data keys: {list(call_data.keys()) if call_data else 'EMPTY'}")
     if call_data:
-        dv = call_data.get('dynamic_variables', {})
+        dv = call_data.get('retell_llm_dynamic_variables', call_data.get('dynamic_variables', {}))
         log.info(f"dynamic_variables keys: {list(dv.keys()) if dv else 'EMPTY'}")
+    # Log full payload for first few calls to diagnose structure
+    log.info(f"FULL PAYLOAD: {json.dumps(payload)[:2000]}")
 
     # Merge call_data — RetellAI sends retell_llm_dynamic_variables inside the call object
     chat = {
@@ -344,6 +352,12 @@ def status():
         last_created=_stats['last_created'] or 'never',
         recent_events=list(reversed(_stats['recent_events'][-20:])),
     )
+
+
+@app.route('/api/debug/last-tool-payload', methods=['GET'])
+def debug_last_payload():
+    """Return the last raw tool call payload for debugging."""
+    return jsonify(_last_tool_payload)
 
 
 @app.route('/api/retry-failed', methods=['POST'])
