@@ -182,8 +182,8 @@ def update_form_submission(submission_id, fields):
     return _sf_composite_update([sf_record])
 
 
-def _build_task_comments(transcript, args):
-    """Build Comments field with transcript and conversation highlights."""
+def _build_task_description(transcript, args):
+    """Build Description field with highlights + full transcript (32K limit)."""
     parts = []
 
     # Highlights from qualification data
@@ -225,6 +225,16 @@ def _build_task_comments(transcript, args):
     return '\n'.join(parts)[:30000] if parts else ''
 
 
+def _build_task_comments(args):
+    """Build Comments field — brief summary only (255 char limit)."""
+    parts = []
+    if args.get('qualification_summary'):
+        parts.append(args['qualification_summary'])
+    elif args.get('conversation_summary'):
+        parts.append(args['conversation_summary'])
+    return '; '.join(parts)[:255] if parts else ''
+
+
 def _build_call_result(args, tier):
     """Build Call/Text Result field from tool args."""
     parts = [f"{'Qualified' if tier == 'qualified' else 'Interested'}"]
@@ -254,10 +264,13 @@ def create_contact_task(record):
     else:
         category = 'Candidate - Nursing Bot'
 
-    # Build comments from transcript + highlights
+    # Build description with highlights + transcript (32K limit)
     args = record.get('args', {})
     transcript = record.get('transcript', '')
-    comments = _build_task_comments(transcript, args)
+    description = _build_task_description(transcript, args)
+
+    # Build brief comments (255 char limit)
+    comments = _build_task_comments(args)
 
     # Build call result summary
     tier = record.get('tier', 'interested')
@@ -267,7 +280,7 @@ def create_contact_task(record):
         'attributes': {'type': 'Task'},
         'WhoId': record['contact_id'],
         'Subject': record.get('subject', 'Violet AI Lead'),
-        'Description': record.get('description', '')[:30000],
+        'Description': description or record.get('description', '')[:30000],
         'Status': 'Open',
         'Priority': record.get('priority', 'Normal'),
         'ActivityDate': date.today().isoformat(),
