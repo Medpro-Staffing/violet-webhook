@@ -182,16 +182,87 @@ def update_form_submission(submission_id, fields):
     return _sf_composite_update([sf_record])
 
 
+def _build_task_comments(transcript, args):
+    """Build Comments field with transcript and conversation highlights."""
+    parts = []
+
+    # Highlights from qualification data
+    highlights = []
+    if args.get('qualification_summary'):
+        highlights.append(f"Qualification: {args['qualification_summary']}")
+    if args.get('interest_level'):
+        highlights.append(f"Interest: {args['interest_level']}")
+    if args.get('available_start'):
+        highlights.append(f"Available: {args['available_start']}")
+    if args.get('certifications'):
+        highlights.append(f"Certifications: {args['certifications']}")
+    if args.get('license_type'):
+        highlights.append(f"License: {args['license_type']}")
+    if args.get('experience_months'):
+        highlights.append(f"Experience: {args['experience_months']} months")
+    if args.get('preferred_contact'):
+        highlights.append(f"Preferred contact: {args['preferred_contact']}")
+    if args.get('conversation_summary'):
+        highlights.append(f"Summary: {args['conversation_summary']}")
+
+    if highlights:
+        parts.append("=== KEY HIGHLIGHTS ===")
+        parts.extend(highlights)
+        parts.append("")
+
+    # Full transcript
+    if transcript:
+        parts.append("=== FULL TRANSCRIPT ===")
+        if isinstance(transcript, str):
+            parts.append(transcript)
+        elif isinstance(transcript, list):
+            for msg in transcript:
+                role = msg.get('role', '?')
+                content = msg.get('content', '')
+                if content:
+                    parts.append(f"{role.capitalize()}: {content}")
+
+    return '\n'.join(parts)[:30000] if parts else ''
+
+
+def _build_call_result(args, tier):
+    """Build Call/Text Result field from tool args."""
+    parts = [f"{'Qualified' if tier == 'qualified' else 'Interested'}"]
+    if args.get('interest_level'):
+        parts.append(f"interest={args['interest_level']}")
+    if args.get('available_start'):
+        parts.append(f"available {args['available_start']}")
+    if args.get('certifications'):
+        parts.append(f"certs: {args['certifications']}")
+    return ' | '.join(parts)
+
+
 def create_contact_task(record):
     """Create a Task record linked to a Contact and optionally a Job.
 
     Args:
         record: dict with contact_id, job_id, subject, description,
-                priority ('High' or 'Normal')
+                priority ('High' or 'Normal'), transcript, args, department
 
     Returns:
         (success: bool, result: dict)
     """
+    # Determine Category based on department
+    dept = record.get('department', '').lower()
+    if 'allied' in dept:
+        category = 'Candidate - Allied Bot'
+    else:
+        category = 'Candidate - Nursing Bot'
+
+    # Build comments from transcript + highlights
+    args = record.get('args', {})
+    transcript = record.get('transcript', '')
+    comments = _build_task_comments(transcript, args)
+
+    # Build call result summary
+    tier = record.get('tier', 'interested')
+    call_result = _build_call_result(args, tier)
+
     sf_record = {
         'attributes': {'type': 'Task'},
         'WhoId': record['contact_id'],
@@ -200,6 +271,12 @@ def create_contact_task(record):
         'Status': 'Open',
         'Priority': record.get('priority', 'Normal'),
         'ActivityDate': date.today().isoformat(),
+        'Type': 'AI Screening',
+        'ContactCandidate_Type__c': 'Domestic',
+        'Category__c': category,
+        'Activity_Type__c': 'Violet AI SMS Screening',
+        'AVTRRT__Call_Result__c': call_result[:255],
+        'AVTRRT__Comments__c': comments,
     }
 
     if record.get('job_id'):
@@ -585,6 +662,10 @@ def handle_conversation_complete(chat, args, notify_fn=None):
         'subject': _build_task_subject('interested', dv_fields),
         'description': analysis['summary'],
         'priority': 'Normal',
+        'transcript': transcript,
+        'args': args,
+        'department': dv_fields.get('job_medpro_dept', ''),
+        'tier': 'interested',
     }
     task_ok, task_result = create_contact_task(task_record)
     if not task_ok:
@@ -696,6 +777,10 @@ def handle_qualified(chat, args, notify_fn=None):
         'subject': _build_task_subject('qualified', dv_fields),
         'description': analysis['summary'],
         'priority': 'High',
+        'transcript': transcript,
+        'args': args,
+        'department': dv_fields.get('job_medpro_dept', ''),
+        'tier': 'qualified',
     }
     task_ok, task_result = create_contact_task(task_record)
     if not task_ok:
@@ -865,12 +950,21 @@ def handle_chat_analyzed(chat, notify_fn=None):
 
     # Create Task
     tier = 'qualified' if is_qualified else 'interested'
+    fallback_args = {
+        'interest_level': interest,
+        'qualification_summary': custom.get('qualification_tier', ''),
+        'conversation_summary': summary,
+    }
     task_record = {
         'contact_id': contact_id,
         'job_id': job_id,
         'subject': _build_task_subject(tier, dv_fields),
         'description': summary,
         'priority': 'High' if is_qualified else 'Normal',
+        'transcript': chat.get('transcript', ''),
+        'args': fallback_args,
+        'department': dv_fields.get('job_medpro_dept', ''),
+        'tier': tier,
     }
     task_ok, task_result = create_contact_task(task_record)
 
