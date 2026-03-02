@@ -12,6 +12,7 @@ Handlers:
 """
 
 import logging
+import threading
 import time
 from datetime import date
 
@@ -33,6 +34,25 @@ RECORD_TYPE_ID = '0123m0000019N8uAAE'
 
 # Interest levels that warrant lead creation
 INTERESTED_LEVELS = ('very_interested', 'somewhat_interested')
+
+# Recruiter assignment pools — round-robin within each pool
+# Bypasses Natterbox Distribution Engine (no DE access for Violet leads)
+RECRUITER_POOLS = {
+    'nursing': [
+        '005A0000004xrDUIAY',  # Camesha Pitterson
+        '0053m00000CV1gnAAD',  # Jean-Carlos Beltran
+        '005cx000001AzODAA0',  # Bryant Salter
+    ],
+    'allied': [
+        '0053m00000Dm03gAAB',  # Joshua Mayer
+        '0052G000005Q7UQQA0',  # Aleanna Vargas
+        '005cx0000007ySTAAY',  # Stephen Williams
+    ],
+}
+
+# Thread-safe round-robin counters (reset on restart — acceptable at this volume)
+_rr_lock = threading.Lock()
+_rr_counters = {'nursing': 0, 'allied': 0}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -311,9 +331,52 @@ def update_contact_lead_status(contact_id):
         'attributes': {'type': 'Contact'},
         'Id': contact_id,
         'Lead_Status__c': 'Hot lead - current',
+        'Source__c': 'Violet AI',
     }
 
     return _sf_composite_update([sf_record])
+
+
+def assign_recruiter(contact_id, department):
+    """Assign a recruiter to a Contact via round-robin.
+
+    Determines Nursing vs Allied pool from department, picks next recruiter,
+    and PATCHes AVTRRT__Recruiter__c on the Contact.
+
+    Args:
+        contact_id: SF Contact ID (003...)
+        department: job_medpro_dept value from dynamic variables
+
+    Returns:
+        (success: bool, recruiter_id: str)
+    """
+    pool_key = 'allied' if 'allied' in (department or '').lower() else 'nursing'
+    pool = RECRUITER_POOLS.get(pool_key, [])
+
+    if not pool:
+        log.warning(f"No recruiters configured for pool: {pool_key}")
+        return False, ''
+
+    # Round-robin selection
+    with _rr_lock:
+        idx = _rr_counters[pool_key] % len(pool)
+        recruiter_id = pool[idx]
+        _rr_counters[pool_key] += 1
+
+    # PATCH Contact
+    sf_record = {
+        'attributes': {'type': 'Contact'},
+        'Id': contact_id,
+        'AVTRRT__Recruiter__c': recruiter_id,
+    }
+
+    success, result = _sf_composite_update([sf_record])
+    if success:
+        log.info(f"Assigned recruiter {recruiter_id} ({pool_key}[{idx}]) to Contact {contact_id}")
+    else:
+        log.error(f"Recruiter assignment failed for Contact {contact_id}: {result}")
+
+    return success, recruiter_id
 
 
 def process_optout(contact_id):
@@ -690,6 +753,12 @@ def handle_conversation_complete(chat, args, notify_fn=None):
     if not ls_ok:
         log.warning(f"[{chat_id[:12]}] Lead_Status__c update failed: {ls_result}")
 
+    # Assign recruiter from pool
+    dept = dv_fields.get('job_medpro_dept', '')
+    rr_ok, rr_id = assign_recruiter(contact_id, dept)
+    if not rr_ok:
+        log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
+
     log.info(f"[{chat_id[:12]}] CREATED: Form Submission {submission_id}")
 
     if notify_fn:
@@ -804,6 +873,12 @@ def handle_qualified(chat, args, notify_fn=None):
     ls_ok, ls_result = update_contact_lead_status(contact_id)
     if not ls_ok:
         log.warning(f"[{chat_id[:12]}] Lead_Status__c update failed: {ls_result}")
+
+    # Assign recruiter from pool
+    dept = dv_fields.get('job_medpro_dept', '')
+    rr_ok, rr_id = assign_recruiter(contact_id, dept)
+    if not rr_ok:
+        log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
 
     if notify_fn:
         notify_fn('created', {
@@ -988,6 +1063,12 @@ def handle_chat_analyzed(chat, notify_fn=None):
     ls_ok, ls_result = update_contact_lead_status(contact_id)
     if not ls_ok:
         log.warning(f"[{chat_id[:12]}] Lead_Status__c update failed: {ls_result}")
+
+    # Assign recruiter from pool
+    dept = dv_fields.get('job_medpro_dept', '')
+    rr_ok, rr_id = assign_recruiter(contact_id, dept)
+    if not rr_ok:
+        log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
 
     result['action'] = 'created'
     result['detail'] = f'Form Submission {submission_id} created (fallback)'
