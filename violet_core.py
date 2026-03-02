@@ -315,6 +315,9 @@ def create_contact_task(record):
     if record.get('job_id'):
         sf_record['WhatId'] = record['job_id']
 
+    if record.get('owner_id'):
+        sf_record['OwnerId'] = record['owner_id']
+
     return _sf_composite_create([sf_record])
 
 
@@ -732,6 +735,12 @@ def handle_conversation_complete(chat, args, notify_fn=None):
 
     submission_id = fs_result.get('id', '')
 
+    # Assign recruiter from pool (before Task so OwnerId is set correctly)
+    dept = dv_fields.get('job_medpro_dept', '')
+    rr_ok, rr_id = assign_recruiter(contact_id, dept)
+    if not rr_ok:
+        log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
+
     # Create Task
     task_record = {
         'contact_id': contact_id,
@@ -743,6 +752,7 @@ def handle_conversation_complete(chat, args, notify_fn=None):
         'args': args,
         'department': dv_fields.get('job_medpro_dept', ''),
         'tier': 'interested',
+        'owner_id': rr_id if rr_ok else '',
     }
     task_ok, task_result = create_contact_task(task_record)
     if not task_ok:
@@ -752,12 +762,6 @@ def handle_conversation_complete(chat, args, notify_fn=None):
     ls_ok, ls_result = update_contact_lead_status(contact_id)
     if not ls_ok:
         log.warning(f"[{chat_id[:12]}] Lead_Status__c update failed: {ls_result}")
-
-    # Assign recruiter from pool
-    dept = dv_fields.get('job_medpro_dept', '')
-    rr_ok, rr_id = assign_recruiter(contact_id, dept)
-    if not rr_ok:
-        log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
 
     log.info(f"[{chat_id[:12]}] CREATED: Form Submission {submission_id}")
 
@@ -853,6 +857,12 @@ def handle_qualified(chat, args, notify_fn=None):
         submission_id = fs_result.get('id', '')
         log.info(f"[{chat_id[:12]}] CREATED QUALIFIED: Form Submission {submission_id}")
 
+    # Assign recruiter from pool (before Task so OwnerId is set correctly)
+    dept = dv_fields.get('job_medpro_dept', '')
+    rr_ok, rr_id = assign_recruiter(contact_id, dept)
+    if not rr_ok:
+        log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
+
     # Create high-priority Task
     task_record = {
         'contact_id': contact_id,
@@ -864,6 +874,7 @@ def handle_qualified(chat, args, notify_fn=None):
         'args': args,
         'department': dv_fields.get('job_medpro_dept', ''),
         'tier': 'qualified',
+        'owner_id': rr_id if rr_ok else '',
     }
     task_ok, task_result = create_contact_task(task_record)
     if not task_ok:
@@ -873,12 +884,6 @@ def handle_qualified(chat, args, notify_fn=None):
     ls_ok, ls_result = update_contact_lead_status(contact_id)
     if not ls_ok:
         log.warning(f"[{chat_id[:12]}] Lead_Status__c update failed: {ls_result}")
-
-    # Assign recruiter from pool
-    dept = dv_fields.get('job_medpro_dept', '')
-    rr_ok, rr_id = assign_recruiter(contact_id, dept)
-    if not rr_ok:
-        log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
 
     if notify_fn:
         notify_fn('created', {
@@ -1039,6 +1044,12 @@ def handle_chat_analyzed(chat, notify_fn=None):
 
     submission_id = fs_result.get('id', '')
 
+    # Assign recruiter from pool (before Task so OwnerId is set correctly)
+    dept = dv_fields.get('job_medpro_dept', '')
+    rr_ok, rr_id = assign_recruiter(contact_id, dept)
+    if not rr_ok:
+        log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
+
     # Create Task
     tier = 'qualified' if is_qualified else 'interested'
     fallback_args = {
@@ -1056,6 +1067,7 @@ def handle_chat_analyzed(chat, notify_fn=None):
         'args': fallback_args,
         'department': dv_fields.get('job_medpro_dept', ''),
         'tier': tier,
+        'owner_id': rr_id if rr_ok else '',
     }
     task_ok, task_result = create_contact_task(task_record)
 
@@ -1063,12 +1075,6 @@ def handle_chat_analyzed(chat, notify_fn=None):
     ls_ok, ls_result = update_contact_lead_status(contact_id)
     if not ls_ok:
         log.warning(f"[{chat_id[:12]}] Lead_Status__c update failed: {ls_result}")
-
-    # Assign recruiter from pool
-    dept = dv_fields.get('job_medpro_dept', '')
-    rr_ok, rr_id = assign_recruiter(contact_id, dept)
-    if not rr_ok:
-        log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
 
     result['action'] = 'created'
     result['detail'] = f'Form Submission {submission_id} created (fallback)'
