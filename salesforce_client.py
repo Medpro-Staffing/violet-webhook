@@ -86,7 +86,7 @@ def _refresh_via_oauth():
     client_id = os.environ.get("SF_CLIENT_ID")
     client_secret = os.environ.get("SF_CLIENT_SECRET")
     refresh_token = os.environ.get("SF_REFRESH_TOKEN")
-    login_url = os.environ.get("SF_LOGIN_URL", "https://surestaff.my.salesforce.com")
+    login_url = os.environ.get("SF_LOGIN_URL", "https://surestaff.my.salesforce.com").strip()
 
     if not all([client_id, client_secret, refresh_token]):
         raise RuntimeError(
@@ -115,7 +115,7 @@ def _refresh_via_password():
     username = os.environ.get("SF_USERNAME")
     password = os.environ.get("SF_PASSWORD", "")
     security_token = os.environ.get("SF_SECURITY_TOKEN", "")
-    login_url = os.environ.get("SF_LOGIN_URL", "https://login.salesforce.com")
+    login_url = os.environ.get("SF_LOGIN_URL", "https://login.salesforce.com").strip()
 
     if not all([client_id, client_secret, username]):
         raise RuntimeError(
