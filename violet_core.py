@@ -524,6 +524,7 @@ def _extract_dynamic_vars(chat):
         'job_title': dv.get('job_title', ''),
         'job_city': dv.get('job_city', ''),
         'job_state': dv.get('job_state', ''),
+        'job_medpro_dept': dv.get('job_medpro_dept', ''),
     }
 
 
