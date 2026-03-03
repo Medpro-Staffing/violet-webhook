@@ -349,11 +349,13 @@ def create_contact_task(record):
     return _sf_composite_create([sf_record])
 
 
-def update_contact_lead_status(contact_id):
+def update_contact_lead_status(contact_id, recruiter_id=''):
     """Set Contact Lead_Status__c to 'Hot lead - current' to trigger recruiter notification.
 
-    This fires MedPro's existing Salesforce Flows (Hot_Lead_Notification_D_Allied,
-    DALD_Hot_Lead_Email_Text_Automation_Flow) which email the assigned recruiter.
+    IMPORTANT: recruiter_id must be included in the same PATCH as Lead_Status__c.
+    The notification flow (Hot_Lead_Notification_Domestic) requires
+    AVTRRT__Recruiter__c IsChanged=True in the same transaction as
+    Lead_Status__c='Hot lead - current' — separate API calls won't trigger it.
 
     Returns:
         (success: bool, result: dict)
@@ -365,7 +367,32 @@ def update_contact_lead_status(contact_id):
         'Source__c': 'Violet AI',
     }
 
+    if recruiter_id:
+        sf_record['AVTRRT__Recruiter__c'] = recruiter_id
+
     return _sf_composite_update([sf_record])
+
+
+def select_recruiter(department):
+    """Pick next recruiter from the round-robin pool (no SF write).
+
+    Returns:
+        recruiter_id: str (empty string if no pool configured)
+    """
+    pool_key = 'allied' if 'allied' in (department or '').lower() else 'nursing'
+    pool = RECRUITER_POOLS.get(pool_key, [])
+
+    if not pool:
+        log.warning(f"No recruiters configured for pool: {pool_key}")
+        return ''
+
+    with _rr_lock:
+        idx = _rr_counters[pool_key] % len(pool)
+        recruiter_id = pool[idx]
+        _rr_counters[pool_key] += 1
+
+    log.info(f"Selected recruiter {recruiter_id} ({pool_key}[{idx}])")
+    return recruiter_id
 
 
 def assign_recruiter(contact_id, department):
@@ -381,18 +408,9 @@ def assign_recruiter(contact_id, department):
     Returns:
         (success: bool, recruiter_id: str)
     """
-    pool_key = 'allied' if 'allied' in (department or '').lower() else 'nursing'
-    pool = RECRUITER_POOLS.get(pool_key, [])
-
-    if not pool:
-        log.warning(f"No recruiters configured for pool: {pool_key}")
+    recruiter_id = select_recruiter(department)
+    if not recruiter_id:
         return False, ''
-
-    # Round-robin selection
-    with _rr_lock:
-        idx = _rr_counters[pool_key] % len(pool)
-        recruiter_id = pool[idx]
-        _rr_counters[pool_key] += 1
 
     # PATCH Contact
     sf_record = {
@@ -403,7 +421,7 @@ def assign_recruiter(contact_id, department):
 
     success, result = _sf_composite_update([sf_record])
     if success:
-        log.info(f"Assigned recruiter {recruiter_id} ({pool_key}[{idx}]) to Contact {contact_id}")
+        log.info(f"Assigned recruiter {recruiter_id} to Contact {contact_id}")
     else:
         log.error(f"Recruiter assignment failed for Contact {contact_id}: {result}")
 
@@ -799,11 +817,9 @@ def handle_conversation_complete(chat, args, notify_fn=None):
 
     submission_id = fs_result.get('id', '')
 
-    # Assign recruiter from pool (before Task so OwnerId is set correctly)
+    # Select recruiter from pool (round-robin only, no SF write yet)
     dept = dv_fields.get('job_medpro_dept', '')
-    rr_ok, rr_id = assign_recruiter(contact_id, dept)
-    if not rr_ok:
-        log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
+    rr_id = select_recruiter(dept)
 
     # Create Task
     task_record = {
@@ -816,16 +832,18 @@ def handle_conversation_complete(chat, args, notify_fn=None):
         'args': args,
         'department': dv_fields.get('job_medpro_dept', ''),
         'tier': 'interested',
-        'owner_id': rr_id if rr_ok else '',
+        'owner_id': rr_id,
     }
     task_ok, task_result = create_contact_task(task_record)
     if not task_ok:
         log.warning(f"[{chat_id[:12]}] Task create failed (Form Submission still created): {task_result}")
 
-    # Update Contact Lead_Status__c to trigger recruiter notification Flows
-    ls_ok, ls_result = update_contact_lead_status(contact_id)
+    # Combined: Lead_Status + Recruiter in same PATCH to trigger notification Flow
+    # (Hot_Lead_Notification_Domestic requires AVTRRT__Recruiter__c IsChanged=True
+    #  in the same transaction as Lead_Status__c='Hot lead - current')
+    ls_ok, ls_result = update_contact_lead_status(contact_id, recruiter_id=rr_id)
     if not ls_ok:
-        log.warning(f"[{chat_id[:12]}] Lead_Status__c update failed: {ls_result}")
+        log.warning(f"[{chat_id[:12]}] Lead_Status__c + Recruiter update failed: {ls_result}")
 
     log.info(f"[{chat_id[:12]}] CREATED: Form Submission {submission_id}")
 
@@ -931,6 +949,7 @@ def handle_qualified(chat, args, notify_fn=None):
 
     # Only assign recruiter + create Task if conversation_complete didn't already
     existing_task_id = check_existing_task(contact_id, job_id)
+    rr_id = ''  # default — set below if we need to assign
 
     if existing_id and existing_task_id:
         # conversation_complete already created FS + Task + assigned recruiter
@@ -938,11 +957,9 @@ def handle_qualified(chat, args, notify_fn=None):
         task_ok = True
         task_result = {'id': existing_task_id}
     else:
-        # First time seeing this lead — assign recruiter + create Task
+        # First time seeing this lead — select recruiter + create Task
         dept = dv_fields.get('job_medpro_dept', '')
-        rr_ok, rr_id = assign_recruiter(contact_id, dept)
-        if not rr_ok:
-            log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
+        rr_id = select_recruiter(dept)
 
         task_record = {
             'contact_id': contact_id,
@@ -954,16 +971,18 @@ def handle_qualified(chat, args, notify_fn=None):
             'args': args,
             'department': dv_fields.get('job_medpro_dept', ''),
             'tier': 'qualified',
-            'owner_id': rr_id if rr_ok else '',
+            'owner_id': rr_id,
         }
         task_ok, task_result = create_contact_task(task_record)
         if not task_ok:
             log.warning(f"[{chat_id[:12]}] Task create failed (Form Submission still created): {task_result}")
 
-    # Update Contact Lead_Status__c to trigger recruiter notification Flows
-    ls_ok, ls_result = update_contact_lead_status(contact_id)
+    # Combined: Lead_Status + Recruiter in same PATCH to trigger notification Flow
+    # For existing leads (conversation_complete already handled), recruiter_id='' means
+    # only Lead_Status is updated. For new leads, both fields change in one transaction.
+    ls_ok, ls_result = update_contact_lead_status(contact_id, recruiter_id=rr_id)
     if not ls_ok:
-        log.warning(f"[{chat_id[:12]}] Lead_Status__c update failed: {ls_result}")
+        log.warning(f"[{chat_id[:12]}] Lead_Status__c + Recruiter update failed: {ls_result}")
 
     # Log conversation to Blackthorn SMS for recruiter visibility
     candidate_phone = dv_fields.get('candidate_phone', '')
