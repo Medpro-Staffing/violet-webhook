@@ -14,7 +14,7 @@ Handlers:
 import logging
 import threading
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 
 import requests
 from salesforce_client import sf_query_all, get_salesforce_credentials
@@ -303,8 +303,10 @@ def create_contact_task(record):
         'WhoId': record['contact_id'],
         'Subject': record.get('subject', 'Violet AI Lead'),
         'Description': description or record.get('description', '')[:30000],
-        'Status': 'Completed',
+        'Status': 'Open',
         'Priority': record.get('priority', 'Normal'),
+        'IsReminderSet': True,
+        'ReminderDateTime': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000+0000'),
         'ActivityDate': date.today().isoformat(),
         'Type': 'AI Screening',
         'ContactCandidate_Type__c': 'Domestic',
