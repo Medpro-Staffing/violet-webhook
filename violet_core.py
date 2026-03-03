@@ -525,6 +525,34 @@ def _sf_composite_update(records):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# BLACKTHORN SMS — Log Violet AI messages to simplesms__SMS_Message__c
+# ══════════════════════════════════════════════════════════════════════
+
+def create_blackthorn_sms(contact_id, from_phone, to_phone, message, chat_id=None):
+    """Log a Violet AI conversation to Blackthorn SMS.
+
+    chat_id links this response record to the outbound campaign SMS
+    via simplesms__Sid__c (same chat_id on both records).
+    """
+    sf_record = {
+        'attributes': {'type': 'simplesms__SMS_Message__c'},
+        'simplesms__Contact__c': contact_id,
+        'simplesms__From_Phone__c': from_phone,
+        'simplesms__To_Phone__c': to_phone,
+        'simplesms__From_Num__c': from_phone,
+        'simplesms__To__c': to_phone,
+        'simplesms__Message__c': message[:255],
+        'simplesms__Message_Full__c': message,
+        'simplesms__Message_Date__c': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000+0000'),
+        'simplesms__Status__c': 'Received',
+        'simplesms__Type__c': 'Incoming',
+    }
+    if chat_id:
+        sf_record['simplesms__Sid__c'] = chat_id
+    return _sf_composite_create([sf_record])
+
+
+# ══════════════════════════════════════════════════════════════════════
 # CONVERSATION ANALYSIS (server-side, replaces waiting for RetellAI)
 # ══════════════════════════════════════════════════════════════════════
 
@@ -685,6 +713,14 @@ def handle_optout(chat, args, notify_fn=None):
 
     if success:
         log.info(f"[{chat_id[:12]}] OPT_OUT: SF Contact updated")
+        # Log opt-out to Blackthorn SMS for recruiter visibility
+        dv = chat.get('retell_llm_dynamic_variables') or {}
+        candidate_phone = dv.get('candidate_phone', '')
+        summary_msg = "[Violet AI - Opt Out] " + optout_text[:500]
+        try:
+            create_blackthorn_sms(contact_id, candidate_phone, '', summary_msg, chat_id=chat_id)
+        except Exception as e:
+            log.warning(f"[{chat_id[:12]}] Blackthorn SMS log failed: {e}")
         if notify_fn:
             notify_fn('optout', {
                 'chat_id': chat_id,
@@ -792,6 +828,14 @@ def handle_conversation_complete(chat, args, notify_fn=None):
         log.warning(f"[{chat_id[:12]}] Lead_Status__c update failed: {ls_result}")
 
     log.info(f"[{chat_id[:12]}] CREATED: Form Submission {submission_id}")
+
+    # Log conversation to Blackthorn SMS for recruiter visibility
+    candidate_phone = dv_fields.get('candidate_phone', '')
+    summary_msg = "[Violet AI - Interested] " + analysis['summary'][:500]
+    try:
+        create_blackthorn_sms(contact_id, candidate_phone, '', summary_msg, chat_id=chat_id)
+    except Exception as e:
+        log.warning(f"[{chat_id[:12]}] Blackthorn SMS log failed: {e}")
 
     if notify_fn:
         notify_fn('created', {
@@ -920,6 +964,14 @@ def handle_qualified(chat, args, notify_fn=None):
     ls_ok, ls_result = update_contact_lead_status(contact_id)
     if not ls_ok:
         log.warning(f"[{chat_id[:12]}] Lead_Status__c update failed: {ls_result}")
+
+    # Log conversation to Blackthorn SMS for recruiter visibility
+    candidate_phone = dv_fields.get('candidate_phone', '')
+    summary_msg = "[Violet AI - Qualified] " + analysis['summary'][:500]
+    try:
+        create_blackthorn_sms(contact_id, candidate_phone, '', summary_msg, chat_id=chat_id)
+    except Exception as e:
+        log.warning(f"[{chat_id[:12]}] Blackthorn SMS log failed: {e}")
 
     if notify_fn:
         notify_fn('created', {
