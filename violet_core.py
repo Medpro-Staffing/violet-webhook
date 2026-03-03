@@ -122,6 +122,30 @@ def check_existing_submissions(contact_id, job_id=None):
     return None
 
 
+def check_existing_task(contact_id, job_id=None):
+    """Check if a Violet AI Task already exists for this contact+job today.
+
+    Returns:
+        Task ID if exists, None otherwise
+    """
+    if not contact_id:
+        return None
+
+    soql = f"SELECT Id FROM Task WHERE WhoId = '{contact_id}' AND Activity_Type__c = 'Violet AI SMS Screening' AND CreatedDate = TODAY"
+    if job_id:
+        soql += f" AND WhatId = '{job_id}'"
+    soql += " LIMIT 1"
+
+    try:
+        records = sf_query_all(soql)
+        if records:
+            return records[0].get('Id')
+    except Exception as e:
+        log.warning(f"Task dedup query failed: {e}")
+
+    return None
+
+
 def create_form_submission(record):
     """Create a Form_Submission__c record in Salesforce.
 
@@ -861,28 +885,36 @@ def handle_qualified(chat, args, notify_fn=None):
         submission_id = fs_result.get('id', '')
         log.info(f"[{chat_id[:12]}] CREATED QUALIFIED: Form Submission {submission_id}")
 
-    # Assign recruiter from pool (before Task so OwnerId is set correctly)
-    dept = dv_fields.get('job_medpro_dept', '')
-    rr_ok, rr_id = assign_recruiter(contact_id, dept)
-    if not rr_ok:
-        log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
+    # Only assign recruiter + create Task if conversation_complete didn't already
+    existing_task_id = check_existing_task(contact_id, job_id)
 
-    # Create high-priority Task
-    task_record = {
-        'contact_id': contact_id,
-        'job_id': job_id,
-        'subject': _build_task_subject('qualified', dv_fields),
-        'description': analysis['summary'],
-        'priority': 'High',
-        'transcript': transcript,
-        'args': args,
-        'department': dv_fields.get('job_medpro_dept', ''),
-        'tier': 'qualified',
-        'owner_id': rr_id if rr_ok else '',
-    }
-    task_ok, task_result = create_contact_task(task_record)
-    if not task_ok:
-        log.warning(f"[{chat_id[:12]}] Task create failed (Form Submission still created): {task_result}")
+    if existing_id and existing_task_id:
+        # conversation_complete already created FS + Task + assigned recruiter
+        log.info(f"[{chat_id[:12]}] SKIP recruiter/task: already handled by conversation_complete (Task {existing_task_id})")
+        task_ok = True
+        task_result = {'id': existing_task_id}
+    else:
+        # First time seeing this lead — assign recruiter + create Task
+        dept = dv_fields.get('job_medpro_dept', '')
+        rr_ok, rr_id = assign_recruiter(contact_id, dept)
+        if not rr_ok:
+            log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
+
+        task_record = {
+            'contact_id': contact_id,
+            'job_id': job_id,
+            'subject': _build_task_subject('qualified', dv_fields),
+            'description': analysis['summary'],
+            'priority': 'High',
+            'transcript': transcript,
+            'args': args,
+            'department': dv_fields.get('job_medpro_dept', ''),
+            'tier': 'qualified',
+            'owner_id': rr_id if rr_ok else '',
+        }
+        task_ok, task_result = create_contact_task(task_record)
+        if not task_ok:
+            log.warning(f"[{chat_id[:12]}] Task create failed (Form Submission still created): {task_result}")
 
     # Update Contact Lead_Status__c to trigger recruiter notification Flows
     ls_ok, ls_result = update_contact_lead_status(contact_id)
@@ -1048,32 +1080,40 @@ def handle_chat_analyzed(chat, notify_fn=None):
 
     submission_id = fs_result.get('id', '')
 
-    # Assign recruiter from pool (before Task so OwnerId is set correctly)
-    dept = dv_fields.get('job_medpro_dept', '')
-    rr_ok, rr_id = assign_recruiter(contact_id, dept)
-    if not rr_ok:
-        log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
+    # Check if Task already exists (from tool handlers)
+    existing_task_id = check_existing_task(contact_id, job_id)
 
-    # Create Task
-    tier = 'qualified' if is_qualified else 'interested'
-    fallback_args = {
-        'interest_level': interest,
-        'qualification_summary': custom.get('qualification_tier', ''),
-        'conversation_summary': summary,
-    }
-    task_record = {
-        'contact_id': contact_id,
-        'job_id': job_id,
-        'subject': _build_task_subject(tier, dv_fields),
-        'description': summary,
-        'priority': 'High' if is_qualified else 'Normal',
-        'transcript': chat.get('transcript', ''),
-        'args': fallback_args,
-        'department': dv_fields.get('job_medpro_dept', ''),
-        'tier': tier,
-        'owner_id': rr_id if rr_ok else '',
-    }
-    task_ok, task_result = create_contact_task(task_record)
+    if existing_task_id:
+        log.info(f"[{chat_id[:12]}] SKIP recruiter/task: already exists (Task {existing_task_id})")
+        task_ok = True
+        task_result = {'id': existing_task_id}
+    else:
+        # Assign recruiter from pool (before Task so OwnerId is set correctly)
+        dept = dv_fields.get('job_medpro_dept', '')
+        rr_ok, rr_id = assign_recruiter(contact_id, dept)
+        if not rr_ok:
+            log.warning(f"[{chat_id[:12]}] Recruiter assignment failed")
+
+        # Create Task
+        tier = 'qualified' if is_qualified else 'interested'
+        fallback_args = {
+            'interest_level': interest,
+            'qualification_summary': custom.get('qualification_tier', ''),
+            'conversation_summary': summary,
+        }
+        task_record = {
+            'contact_id': contact_id,
+            'job_id': job_id,
+            'subject': _build_task_subject(tier, dv_fields),
+            'description': summary,
+            'priority': 'High' if is_qualified else 'Normal',
+            'transcript': chat.get('transcript', ''),
+            'args': fallback_args,
+            'department': dv_fields.get('job_medpro_dept', ''),
+            'tier': tier,
+            'owner_id': rr_id if rr_ok else '',
+        }
+        task_ok, task_result = create_contact_task(task_record)
 
     # Update Contact Lead_Status__c to trigger recruiter notification Flows
     ls_ok, ls_result = update_contact_lead_status(contact_id)
