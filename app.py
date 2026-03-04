@@ -68,6 +68,7 @@ _stats = {
 }
 
 RETELL_API_KEY = os.environ.get('RETELL_API_KEY', '')
+WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')
 MAX_RECENT_EVENTS = 50
 
 # Debug: store last raw tool payload for diagnostics
@@ -429,7 +430,16 @@ def webhook_apply_now():
 
     Requires APPLY_NOW_AGENT_ID and APPLY_NOW_FROM_NUMBER env vars
     to be set for Phase 2 SMS sending. Without them, logs only.
+
+    Security: Requires X-Webhook-Secret header matching WEBHOOK_SECRET env var.
     """
+    # Verify webhook secret
+    if WEBHOOK_SECRET:
+        provided = request.headers.get('X-Webhook-Secret', '')
+        if not hmac.compare_digest(provided, WEBHOOK_SECRET):
+            log.warning("apply-now: invalid or missing X-Webhook-Secret")
+            return jsonify({'error': 'unauthorized'}), 401
+
     raw_body = request.get_data()
 
     try:
