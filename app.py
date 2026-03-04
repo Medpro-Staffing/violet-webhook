@@ -444,6 +444,7 @@ def webhook_apply_now():
                   json.dumps(payload)[:120], source='webhook')
 
     # Process through Apply Now handler
+    result = {'status': 'received'}
     try:
         result = violet_core.handle_apply_now(payload)
         status = result.get('status', 'received')
@@ -460,9 +461,10 @@ def webhook_apply_now():
         log.exception(f"Error processing apply-now webhook: {e}")
         _record_event('error', 'sf-trigger', f'apply_now: {str(e)[:100]}',
                       source='webhook')
+        result = {'status': 'error', 'message': str(e)[:200]}
 
     # Always return 200 — never make SF trigger retry
-    return jsonify({'status': 'received'}), 200
+    return jsonify(result), 200
 
 
 # ══════════════════════════════════════════════════════════════════════

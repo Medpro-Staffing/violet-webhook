@@ -883,7 +883,9 @@ def handle_apply_now(payload):
                 'contact_id': contact_id}
 
     # After-hours check — during business hours, recruiters handle directly
-    if not is_after_hours():
+    # _bypass_hours_check flag allows testing during business hours
+    bypass_hours = payload.get('_bypass_hours_check', False)
+    if not bypass_hours and not is_after_hours():
         log.info(f"APPLY_NOW: Business hours — recruiters handle, skipping SMS")
         return {'status': 'skipped_business_hours',
                 'message': 'Business hours — recruiters handle',
