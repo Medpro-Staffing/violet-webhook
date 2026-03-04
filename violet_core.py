@@ -6,12 +6,14 @@ fallback webhooks. Creates Form Submissions + Tasks instead of Job Applicants.
 Handlers:
   handle_first_response()        — Log engagement when candidate replies
   handle_optout()                — Update SF Contact opt-out fields
-  handle_conversation_complete() — Create Form Submission + Task for interested leads
+  handle_conversation_complete() — Create/update Form Submission + Task for interested leads
   handle_qualified()             — Create/update Form Submission (high priority) + Task
   handle_chat_analyzed()         — Fallback: enrich or create from post-chat analysis
+  handle_apply_now()             — After-hours instant SMS response to Apply Now submissions
 """
 
 import logging
+import os
 import threading
 import time
 from datetime import date, datetime, timezone
@@ -55,6 +57,10 @@ RECRUITER_POOLS = {
 # Thread-safe round-robin counters (reset on restart — acceptable at this volume)
 _rr_lock = threading.Lock()
 _rr_counters = {'nursing': 0, 'allied': 0}
+
+# Apply Now dedup tracking (in-memory, reset on restart — acceptable at this volume)
+_apply_now_lock = threading.Lock()
+_apply_now_sent = set()  # Set of form_submission_ids already processed
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -546,11 +552,14 @@ def _sf_composite_update(records):
 # BLACKTHORN SMS — Log Violet AI messages to simplesms__SMS_Message__c
 # ══════════════════════════════════════════════════════════════════════
 
-def create_blackthorn_sms(contact_id, from_phone, to_phone, message, chat_id=None):
+def create_blackthorn_sms(contact_id, from_phone, to_phone, message, chat_id=None,
+                          sms_type='Incoming', sms_status='Received'):
     """Log a Violet AI conversation to Blackthorn SMS.
 
     chat_id links this response record to the outbound campaign SMS
     via simplesms__Sid__c (same chat_id on both records).
+
+    For outbound Apply Now responses, use sms_type='Outgoing', sms_status='Sent'.
     """
     sf_record = {
         'attributes': {'type': 'simplesms__SMS_Message__c'},
@@ -562,8 +571,9 @@ def create_blackthorn_sms(contact_id, from_phone, to_phone, message, chat_id=Non
         'simplesms__Message__c': message[:255],
         'simplesms__Message_Full__c': message,
         'simplesms__Message_Date__c': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000+0000'),
-        'simplesms__Status__c': 'Received',
-        'simplesms__Type__c': 'Incoming',
+        'simplesms__Status__c': sms_status,
+        'simplesms__Type__c': sms_type,
+        'simplesms__Bulk_Message__c': False,
     }
     if chat_id:
         sf_record['simplesms__Sid__c'] = chat_id
@@ -683,6 +693,294 @@ def _build_task_subject(tier, dv):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# APPLY NOW — After-hours instant response to Apply Now submissions
+# ══════════════════════════════════════════════════════════════════════
+
+def is_after_hours():
+    """Check if current time is outside M-F 8:30am-5:30pm ET business hours."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo('America/New_York'))
+    except (ImportError, KeyError):
+        # Fallback for environments without tzdata (e.g., Windows)
+        now = datetime.now(timezone(timedelta(hours=-5)))
+    # Weekend
+    if now.weekday() >= 5:
+        return True
+    # Before 8:30am
+    if now.hour < 8 or (now.hour == 8 and now.minute < 30):
+        return True
+    # After 5:30pm
+    if now.hour > 17 or (now.hour == 17 and now.minute >= 30):
+        return True
+    return False
+
+
+def normalize_phone(phone):
+    """Normalize a phone number to E.164 format (+1XXXXXXXXXX).
+
+    Returns E.164 string or empty string if invalid.
+    """
+    if not phone:
+        return ''
+    digits = ''.join(c for c in str(phone) if c.isdigit())
+    if len(digits) == 10:
+        return f'+1{digits}'
+    if len(digits) == 11 and digits[0] == '1':
+        return f'+{digits}'
+    if phone.startswith('+') and len(digits) >= 10:
+        return f'+{digits}'
+    return ''
+
+
+def check_contact_optout(contact_id):
+    """Check if a Contact has opted out of SMS.
+
+    Returns True if opted out, False otherwise.
+    """
+    soql = f"SELECT simplesms__DoNotSMS__c, Long_Code_Text_Opt_Out__c FROM Contact WHERE Id = '{contact_id}' LIMIT 1"
+    try:
+        records = sf_query_all(soql)
+        if records:
+            rec = records[0]
+            if rec.get('simplesms__DoNotSMS__c'):
+                return True
+            if rec.get('Long_Code_Text_Opt_Out__c'):
+                return True
+    except Exception as e:
+        log.warning(f"Opt-out check failed for {contact_id}: {e}")
+    return False
+
+
+def check_apply_now_sent(form_submission_id):
+    """Check if we already sent an Apply Now SMS for this Form Submission."""
+    with _apply_now_lock:
+        return form_submission_id in _apply_now_sent
+
+
+def record_apply_now_sent(form_submission_id, chat_id):
+    """Record that we sent an Apply Now SMS for this Form Submission."""
+    with _apply_now_lock:
+        _apply_now_sent.add(form_submission_id)
+    log.info(f"APPLY_NOW: recorded sent for FS {form_submission_id}, chat={chat_id}")
+
+
+def send_apply_now_sms(contact_id, phone_e164, candidate_vars, job_vars,
+                       form_submission_id, from_number):
+    """Send Violet SMS to an Apply Now applicant via RetellAI API.
+
+    Creates an SMS chat using the Apply Now agent. Returns chat_id on success,
+    None on failure.
+    """
+    retell_key = os.environ.get('RETELL_API_KEY', '')
+    agent_id = os.environ.get('APPLY_NOW_AGENT_ID', '')
+
+    if not retell_key or not agent_id:
+        log.error("APPLY_NOW: RETELL_API_KEY or APPLY_NOW_AGENT_ID not configured")
+        return None
+
+    # Build dynamic variables — includes all existing campaign vars plus Apply Now markers
+    dynamic_variables = {
+        **candidate_vars,
+        **job_vars,
+        'form_submission_id': form_submission_id,
+        'response_source': 'apply_now',
+    }
+
+    payload = {
+        'agent_id': agent_id,
+        'from_number': from_number,
+        'to_number': phone_e164,
+        'retell_llm_dynamic_variables': dynamic_variables,
+    }
+
+    try:
+        resp = requests.post(
+            'https://api.retellai.com/create-sms-chat',
+            headers={
+                'Authorization': f'Bearer {retell_key}',
+                'Content-Type': 'application/json',
+            },
+            json=payload,
+            timeout=30,
+        )
+    except Exception as e:
+        log.error(f"APPLY_NOW: RetellAI API error: {e}")
+        return None
+
+    if resp.status_code in (200, 201):
+        data = resp.json()
+        chat_id = data.get('chat_id', '')
+        log.info(f"APPLY_NOW: SMS sent — chat_id={chat_id}, contact={contact_id}")
+        return chat_id
+    else:
+        log.error(f"APPLY_NOW: RetellAI API {resp.status_code}: {resp.text[:300]}")
+        return None
+
+
+def handle_apply_now(payload):
+    """Handle incoming Apply Now form submission from SF trigger.
+
+    Validates the payload, checks after-hours + opt-out, then sends
+    RetellAI SMS via send_apply_now_sms().
+
+    Field names are best-guess from SF trigger — adapt after Phase 1 discovery.
+
+    Returns:
+        dict with status, message, and optional contact_id/chat_id
+    """
+    # Extract fields from payload — try multiple naming conventions
+    # until we see the real payload format from SF trigger
+    contact_id = (payload.get('contact_id') or payload.get('ContactId')
+                  or payload.get('Contact_Candidate__c') or '')
+    form_submission_id = (payload.get('form_submission_id') or payload.get('Id')
+                         or payload.get('FormSubmissionId') or '')
+    phone = (payload.get('phone') or payload.get('Phone')
+             or payload.get('Your_Phone__c') or '')
+    first_name = (payload.get('first_name') or payload.get('FirstName')
+                  or payload.get('Your_First__c') or '')
+    last_name = (payload.get('last_name') or payload.get('LastName')
+                 or payload.get('Your_Last__c') or '')
+    email = (payload.get('email') or payload.get('Email')
+             or payload.get('Your_Email__c') or '')
+    job_id = (payload.get('job_id') or payload.get('JobId')
+              or payload.get('Job__c') or '')
+    job_title = (payload.get('job_title') or payload.get('JobTitle')
+                 or payload.get('Job_Title__c') or '')
+    job_city = (payload.get('job_city') or payload.get('JobCity')
+                or payload.get('Job_City__c') or '')
+    job_state = (payload.get('job_state') or payload.get('JobState')
+                 or payload.get('Job_State__c') or '')
+    job_dept = (payload.get('job_dept') or payload.get('Department')
+                or payload.get('job_medpro_dept') or '')
+
+    log.info(f"APPLY_NOW: contact={contact_id}, phone={phone}, "
+             f"job={job_title}, fs={form_submission_id}")
+
+    # Validate required fields
+    if not contact_id:
+        return {'status': 'skipped', 'message': 'Missing contact_id'}
+    if not phone:
+        # Try to look up phone from SF Contact
+        try:
+            records = sf_query_all(
+                f"SELECT MobilePhone, Phone FROM Contact WHERE Id = '{contact_id}' LIMIT 1"
+            )
+            if records:
+                phone = records[0].get('MobilePhone') or records[0].get('Phone') or ''
+        except Exception as e:
+            log.warning(f"APPLY_NOW: Phone lookup failed: {e}")
+
+        if not phone:
+            return {'status': 'skipped', 'message': 'Missing phone number'}
+
+    # Check agent configuration
+    agent_id = os.environ.get('APPLY_NOW_AGENT_ID', '')
+    from_number = os.environ.get('APPLY_NOW_FROM_NUMBER', '')
+    if not agent_id or not from_number:
+        log.info("APPLY_NOW: Agent not configured (Phase 1 — logging only)")
+        return {'status': 'logged', 'message': 'Payload logged, agent not configured yet',
+                'contact_id': contact_id}
+
+    # After-hours check — during business hours, recruiters handle directly
+    if not is_after_hours():
+        log.info(f"APPLY_NOW: Business hours — recruiters handle, skipping SMS")
+        return {'status': 'skipped_business_hours',
+                'message': 'Business hours — recruiters handle',
+                'contact_id': contact_id}
+
+    # Opt-out check
+    if check_contact_optout(contact_id):
+        log.info(f"APPLY_NOW: Contact {contact_id} opted out — skipping SMS")
+        return {'status': 'skipped_optout', 'message': 'Contact opted out of SMS',
+                'contact_id': contact_id}
+
+    # Dedup: don't re-send if already sent for this Form Submission
+    if form_submission_id and check_apply_now_sent(form_submission_id):
+        log.info(f"APPLY_NOW: Already sent for FS {form_submission_id}")
+        return {'status': 'skipped_dedup',
+                'message': 'Already sent for this form submission',
+                'contact_id': contact_id}
+
+    # Normalize phone to E.164
+    phone_e164 = normalize_phone(phone)
+    if not phone_e164:
+        return {'status': 'skipped', 'message': f'Invalid phone number: {phone}',
+                'contact_id': contact_id}
+
+    # Query SF for missing job details if we have job_id but no title
+    if job_id and not job_title:
+        try:
+            records = sf_query_all(
+                f"SELECT Name, AVTRRT__City__c, AVTRRT__State__c, MedPro_Dept__c FROM AVTRRT__Job__c WHERE Id = '{job_id}' LIMIT 1"
+            )
+            if records:
+                job_title = records[0].get('Name', '')
+                job_city = job_city or records[0].get('AVTRRT__City__c', '')
+                job_state = job_state or records[0].get('AVTRRT__State__c', '')
+                job_dept = job_dept or records[0].get('MedPro_Dept__c', '')
+        except Exception as e:
+            log.warning(f"APPLY_NOW: Job lookup failed: {e}")
+
+    # Build dynamic variables for RetellAI agent
+    candidate_vars = {
+        'candidate_id': contact_id,
+        'candidate_first_name': first_name,
+        'candidate_last_name': last_name,
+        'candidate_email': email,
+        'candidate_phone': phone_e164,
+    }
+    job_vars = {
+        'job_ID_18': job_id,
+        'job_title': job_title,
+        'job_city': job_city,
+        'job_state': job_state,
+        'job_medpro_dept': job_dept,
+    }
+
+    # Send SMS via RetellAI
+    chat_id = send_apply_now_sms(
+        contact_id=contact_id,
+        phone_e164=phone_e164,
+        candidate_vars=candidate_vars,
+        job_vars=job_vars,
+        form_submission_id=form_submission_id,
+        from_number=from_number,
+    )
+
+    if not chat_id:
+        return {'status': 'error', 'message': 'RetellAI SMS send failed',
+                'contact_id': contact_id}
+
+    # Track that we sent for this FS (dedup)
+    if form_submission_id:
+        record_apply_now_sent(form_submission_id, chat_id)
+
+    # Log outbound SMS to Blackthorn for recruiter visibility
+    bt_msg = f"Violet AI - Apply Now Response: {job_title}"
+    try:
+        create_blackthorn_sms(
+            contact_id=contact_id,
+            from_phone=from_number,
+            to_phone=phone_e164,
+            message=bt_msg,
+            chat_id=chat_id,
+            sms_type='Outgoing',
+            sms_status='Sent',
+        )
+    except Exception as e:
+        log.warning(f"APPLY_NOW: Blackthorn SMS log failed: {e}")
+
+    log.info(f"APPLY_NOW: Complete — SMS sent to {contact_id}, chat_id={chat_id}")
+    return {
+        'status': 'sent',
+        'message': f'SMS sent, chat_id={chat_id}',
+        'contact_id': contact_id,
+        'chat_id': chat_id,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
 # TOOL HANDLERS — Called from app.py webhook routes
 # ══════════════════════════════════════════════════════════════════════
 
@@ -786,36 +1084,55 @@ def handle_conversation_complete(chat, args, notify_fn=None):
         log.warning(f"[{chat_id[:12]}] SKIP: no job ID")
         return {'status': 'error', 'message': 'Missing job ID'}
 
-    # Dedup
-    existing_id = check_existing_submissions(contact_id, job_id)
-    if existing_id:
-        log.info(f"[{chat_id[:12]}] DEDUP: Form Submission {existing_id} already exists")
-        return {
-            'status': 'lead_exists',
-            'message': 'Lead already recorded for recruiter review',
-        }
+    # Apply Now detection — form_submission_id in dynamic vars means this is
+    # a response to an Apply Now application (FS already exists in SF)
+    dv = chat.get('retell_llm_dynamic_variables') or {}
+    is_apply_now = dv.get('response_source') == 'apply_now'
+    apply_now_fs_id = dv.get('form_submission_id', '') if is_apply_now else ''
+
+    # Dedup check (outbound campaigns only — Apply Now uses explicit form_submission_id)
+    if not is_apply_now:
+        existing_id = check_existing_submissions(contact_id, job_id)
+        if existing_id:
+            log.info(f"[{chat_id[:12]}] DEDUP: Form Submission {existing_id} already exists")
+            return {
+                'status': 'lead_exists',
+                'message': 'Lead already recorded for recruiter review',
+            }
 
     # Analyze conversation
     transcript = chat.get('transcript', [])
     analysis = analyze_conversation(transcript, args)
 
-    # Build Form Submission record
-    record = {
-        'contact_id': contact_id,
-        'job_id': job_id,
-        'lead_outcome': analysis['lead_outcome'],
-        'is_qualified': False,
-        'summary': analysis['summary'],
-        **dv_fields,
-    }
+    if apply_now_fs_id:
+        # Apply Now: update existing Form Submission from the application
+        log.info(f"[{chat_id[:12]}] APPLY_NOW: updating Form Submission {apply_now_fs_id}")
+        update_fields = {
+            'Lead_Outcome__c': analysis['lead_outcome'],
+        }
+        if analysis['summary']:
+            update_fields['Questions_Comments__c'] = analysis['summary'][:3000]
+        upd_ok, upd_result = update_form_submission(apply_now_fs_id, update_fields)
+        if not upd_ok:
+            log.error(f"[{chat_id[:12]}] ERROR: Form Submission update failed: {upd_result}")
+        submission_id = apply_now_fs_id
+    else:
+        # Create new Form Submission (outbound campaign)
+        record = {
+            'contact_id': contact_id,
+            'job_id': job_id,
+            'lead_outcome': analysis['lead_outcome'],
+            'is_qualified': False,
+            'summary': analysis['summary'],
+            **dv_fields,
+        }
+        fs_ok, fs_result = create_form_submission(record)
+        if not fs_ok:
+            err_detail = fs_result.get('error', 'unknown')
+            log.error(f"[{chat_id[:12]}] ERROR: Form Submission create failed: {fs_result}")
+            return {'status': 'error', 'message': f'Failed to create lead record: {err_detail}'}
 
-    fs_ok, fs_result = create_form_submission(record)
-    if not fs_ok:
-        err_detail = fs_result.get('error', 'unknown')
-        log.error(f"[{chat_id[:12]}] ERROR: Form Submission create failed: {fs_result}")
-        return {'status': 'error', 'message': f'Failed to create lead record: {err_detail}'}
-
-    submission_id = fs_result.get('id', '')
+        submission_id = fs_result.get('id', '')
 
     # Select recruiter from pool (round-robin only, no SF write yet)
     dept = dv_fields.get('job_medpro_dept', '')
@@ -907,8 +1224,10 @@ def handle_qualified(chat, args, notify_fn=None):
         'has_required_credentials': True,
     })
 
-    # Check if Form Submission already exists (from conversation_complete)
-    existing_id = check_existing_submissions(contact_id, job_id)
+    # Check if Form Submission already exists (from conversation_complete or Apply Now)
+    dv = chat.get('retell_llm_dynamic_variables') or {}
+    apply_now_fs_id = dv.get('form_submission_id', '') if dv.get('response_source') == 'apply_now' else ''
+    existing_id = apply_now_fs_id or check_existing_submissions(contact_id, job_id)
 
     if existing_id:
         # Update existing to qualified

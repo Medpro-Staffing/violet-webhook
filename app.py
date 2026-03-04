@@ -6,6 +6,7 @@ plus chat_analyzed webhooks as a fallback safety net.
 Routes:
   POST /webhook/retell/tool  — Handle custom tool calls (real-time)
   POST /webhook/retell       — Handle chat_analyzed events (fallback)
+  POST /webhook/sf/apply-now — Handle Apply Now form submissions from SF trigger
   GET  /health               — Health check (SF connection, uptime)
   GET  /status               — HTML monitoring dashboard
   POST /api/retry-failed     — Replay dead letter queue
@@ -57,6 +58,8 @@ _stats = {
     'skipped': 0,
     'optouts': 0,
     'first_responses': 0,
+    'apply_now_received': 0,
+    'apply_now_sent': 0,
     'errors': 0,
     'last_webhook': None,
     'last_tool_call': None,
@@ -96,6 +99,10 @@ def _record_event(event_type, chat_id, detail, source='webhook'):
             _stats['optouts'] += 1
         elif event_type == 'first_response':
             _stats['first_responses'] += 1
+        elif event_type == 'apply_now_received':
+            _stats['apply_now_received'] += 1
+        elif event_type == 'apply_now_sent':
+            _stats['apply_now_sent'] += 1
 
         _stats['recent_events'].append({
             'time': datetime.now(timezone.utc).strftime('%H:%M:%S'),
@@ -308,6 +315,8 @@ def health():
             'created': _stats['created'],
             'enriched': _stats['enriched'],
             'optouts': _stats['optouts'],
+            'apply_now_received': _stats['apply_now_received'],
+            'apply_now_sent': _stats['apply_now_sent'],
             'errors': _stats['errors'],
         },
     })
@@ -404,6 +413,56 @@ def retry_failed():
         'archived': archive_path,
         'results': results,
     })
+
+
+# ══════════════════════════════════════════════════════════════════════
+# APPLY NOW — After-hours instant response to Apply Now submissions
+# ══════════════════════════════════════════════════════════════════════
+
+@app.route('/webhook/sf/apply-now', methods=['POST'])
+def webhook_apply_now():
+    """Handle Apply Now form submission notifications from Salesforce trigger.
+
+    Phase 1: Logs raw payload for discovery (always runs).
+    Phase 2: Parses fields, validates, checks after-hours + opt-out,
+             sends RetellAI SMS, logs to Blackthorn.
+
+    Requires APPLY_NOW_AGENT_ID and APPLY_NOW_FROM_NUMBER env vars
+    to be set for Phase 2 SMS sending. Without them, logs only.
+    """
+    raw_body = request.get_data()
+
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        log.warning("Invalid JSON in apply-now webhook body")
+        return '', 400
+
+    # Always log raw payload for debugging / payload discovery
+    log.info(f"APPLY_NOW PAYLOAD: {json.dumps(payload)[:3000]}")
+    _record_event('apply_now_received', 'sf-trigger',
+                  json.dumps(payload)[:120], source='webhook')
+
+    # Process through Apply Now handler
+    try:
+        result = violet_core.handle_apply_now(payload)
+        status = result.get('status', 'received')
+        contact_id = result.get('contact_id', 'unknown')
+
+        log.info(f"APPLY_NOW RESULT: status={status}, "
+                 f"contact={contact_id}, msg={result.get('message', '')}")
+
+        if status == 'sent':
+            _record_event('apply_now_sent', contact_id[:12],
+                          result.get('message', '')[:120], source='webhook')
+
+    except Exception as e:
+        log.exception(f"Error processing apply-now webhook: {e}")
+        _record_event('error', 'sf-trigger', f'apply_now: {str(e)[:100]}',
+                      source='webhook')
+
+    # Always return 200 — never make SF trigger retry
+    return jsonify({'status': 'received'}), 200
 
 
 # ══════════════════════════════════════════════════════════════════════
