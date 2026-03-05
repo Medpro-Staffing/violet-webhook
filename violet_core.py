@@ -41,16 +41,18 @@ INTERESTED_LEVELS = ('very_interested', 'somewhat_interested')
 # Bypasses Natterbox Distribution Engine (no DE access for Violet leads)
 RECRUITER_POOLS = {
     'nursing': [
-        '005A0000004xrDUIAY',  # Camesha Pitterson
-        '0053m00000CV1gnAAD',  # Jean-Carlos Beltran
-        '005cx000001AzODAA0',  # Bryant Salter
-        '005cx000008TXs1AAG',  # Ronnie Diaz
-        '0052G00000AdNNYQA3',  # Sabrina Cornell
+        '0053m00000Dm0B6AAJ',  # Jason Gilbreath (TEST OVERRIDE — revert after testing)
+        # '005A0000004xrDUIAY',  # Camesha Pitterson
+        # '0053m00000CV1gnAAD',  # Jean-Carlos Beltran
+        # '005cx000001AzODAA0',  # Bryant Salter
+        # '005cx000008TXs1AAG',  # Ronnie Diaz
+        # '0052G00000AdNNYQA3',  # Sabrina Cornell
     ],
     'allied': [
-        '0053m00000Dm03gAAB',  # Joshua Mayer
-        '0052G000005Q7UQQA0',  # Aleanna Vargas
-        '005cx0000007ySTAAY',  # Stephen Williams
+        '0053m00000Dm0B6AAJ',  # Jason Gilbreath (TEST OVERRIDE — revert after testing)
+        # '0053m00000Dm03gAAB',  # Joshua Mayer
+        # '0052G000005Q7UQQA0',  # Aleanna Vargas
+        # '005cx0000007ySTAAY',  # Stephen Williams
     ],
 }
 
