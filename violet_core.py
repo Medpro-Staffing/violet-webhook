@@ -788,9 +788,9 @@ def send_apply_now_sms(contact_id, phone_e164, candidate_vars, job_vars,
     }
 
     payload = {
-        'agent_id': agent_id,
         'from_number': from_number,
         'to_number': phone_e164,
+        'override_agent_id': agent_id,
         'retell_llm_dynamic_variables': dynamic_variables,
     }
 
