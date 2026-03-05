@@ -716,6 +716,37 @@ def is_after_hours():
     return False
 
 
+def get_recruiter_followup_timeframe():
+    """Return a human-readable timeframe for when a recruiter will follow up.
+
+    Based on current ET time:
+    - Weeknight (Sun-Thu): "first thing tomorrow morning"
+    - Friday night: "Monday morning"
+    - Saturday: "Monday morning"
+    - Sunday (before business hours): "later today" or "first thing tomorrow morning"
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo('America/New_York'))
+    except (ImportError, KeyError):
+        now = datetime.now(timezone(timedelta(hours=-5)))
+
+    weekday = now.weekday()  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
+
+    if weekday == 4 and (now.hour > 17 or (now.hour == 17 and now.minute >= 30)):
+        # Friday evening
+        return "Monday morning"
+    elif weekday == 5:
+        # Saturday
+        return "Monday morning"
+    elif weekday == 6:
+        # Sunday
+        return "first thing tomorrow morning"
+    else:
+        # Mon-Fri evening/night
+        return "first thing tomorrow morning"
+
+
 def normalize_phone(phone):
     """Normalize a phone number to E.164 format (+1XXXXXXXXXX).
 
@@ -785,6 +816,7 @@ def send_apply_now_sms(contact_id, phone_e164, candidate_vars, job_vars,
         **job_vars,
         'form_submission_id': form_submission_id,
         'response_source': 'apply_now',
+        'recruiter_followup_timeframe': get_recruiter_followup_timeframe(),
     }
 
     payload = {
